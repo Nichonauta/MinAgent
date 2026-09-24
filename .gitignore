@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+
+# Local MCP configuration may contain commands, paths, headers, or credentials.
+.minagent/mcp.json
+
+# Runtime and editor files
+node_modules/
+*.log
+.DS_Store
+Thumbs.db

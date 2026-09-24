@@ -1,0 +1,1 @@
+This project was inspired by Pi, the agent harness at https://pi.dev/ (https://github.com/earendil-works/pi). Pi is distributed under the MIT License, copyright Mario Zechner and contributors. This small standalone implementation was written for the requested reduced workflow and does not include upstream Pi source files.
