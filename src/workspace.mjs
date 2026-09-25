@@ -448,7 +448,8 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 	}
 
 	async function refreshInventory({ includeSnapshot = listLimit !== 0, listLimitOverride = listLimit } = {}) {
-		const traversalLimit = listLimitOverride;
+		// A disabled prompt inventory still needs a bounded local file index for @ autocomplete.
+		const traversalLimit = listLimitOverride === 0 && !includeSnapshot ? -1 : listLimitOverride;
 		const lines = includeSnapshot ? [
 			"## Workspace inventory (paths only; generated directories excluded)",
 			`Per-directory limit: ${listLimitOverride === -1 ? "unlimited" : listLimitOverride}`,

@@ -67,7 +67,7 @@ test("inventory excludes generated directories and obeys the listing limit", asy
 	const complete = await createWorkspaceAccess(root, "test").refreshInventory();
 	assert.deepEqual(complete.files, ["src/main.mjs"]);
 	const empty = await createWorkspaceAccess(root, "test", 0).refreshInventory();
-	assert.deepEqual(empty.files, []);
+	assert.deepEqual(empty.files, ["src/main.mjs"]);
 });
 
 test("disabled inventory still loads AGENTS.md and permits a one-time full listing", async (t) => {
@@ -78,7 +78,7 @@ test("disabled inventory still loads AGENTS.md and permits a one-time full listi
 	const access = createWorkspaceAccess(root, "test", 0);
 	const normal = await access.refreshInventory();
 	assert.equal(normal.snapshot, "");
-	assert.deepEqual(normal.files, []);
+	assert.deepEqual(normal.files, ["AGENTS.md", "README.md"]);
 	assert.match(normal.agentsContext, /Project guidance/);
 	const forInit = await access.refreshInventory({ includeSnapshot: true, listLimitOverride: -1 });
 	assert.match(forInit.snapshot, /\[FILE\] README\.md/);
