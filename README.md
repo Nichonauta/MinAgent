@@ -95,6 +95,7 @@ Set `NO_COLOR` to disable terminal colors.
 
 Type `/` to open command autocomplete. Use ↑/↓ to choose a command and Enter to complete it in the current line; press Enter again to run it. The available commands are:
 
+- `/context`: show approximate token counts for system sections, available tool schemas, and conversation history, plus the latest endpoint-reported `prompt_tokens` when available.
 - `/compact [instructions]`: summarize older conversation history and keep the recent messages.
 - `/init [focus]`: inspect a one-time workspace inventory and selected project files, show which files were selected, and create or update the workspace root `AGENTS.md`. It reads up to 24 files, with excerpt and total-size limits.
 - `/new`: clear the screen and start a new conversation.
