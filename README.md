@@ -23,7 +23,7 @@ OPENAI_MODEL=llama.cpp
 OPENAI_INPUT=text,image
 OPENAI_CONTEXT_WINDOW=262144
 OPENAI_SHOW_REASONING=off
-WORKSPACE_LIST_LIMIT=-1
+WORKSPACE_LIST_LIMIT=0
 TERMINAL_MODE=off
 SKILLS_ENABLED=off
 MCP_ENABLED=off
@@ -39,7 +39,7 @@ Boolean settings use only `on` and `off`:
 
 For llama.cpp, use `--reasoning-format deepseek` when the model template does not automatically emit a separate `reasoning_content` channel. MinAgent displays that channel as progress text and keeps the final answer in its normal response presentation.
 
-`OPENAI_INPUT` must contain `text` and may also contain `image`. `OPENAI_CONTEXT_WINDOW` is a positive integer and defaults to `262144` tokens; set it to the actual model context limit. `WORKSPACE_LIST_LIMIT` defaults to `-1`, which lists all entries except common generated directories such as `.git`, `node_modules`, `dist`, and `build`. A non-negative value limits both the entries shown and the paths collected per directory. The inventory stops at 10,000 entries or 128 KiB of text. `TERMINAL_MODE` accepts lowercase `auto`, `ask`, or `off`, and defaults to `ask` when it is not set.
+`OPENAI_INPUT` must contain `text` and may also contain `image`. `OPENAI_CONTEXT_WINDOW` is a positive integer and defaults to `262144` tokens; set it to the actual model context limit. `WORKSPACE_LIST_LIMIT` defaults to `0`, which disables recursive inventory and `@` file suggestions. The model can still call `list_directory` for a focused listing. A positive value includes up to that many entries per directory; `-1` includes all entries. Inventories exclude common generated directories and stop at 10,000 entries or 128 KiB of text. `/init` builds a one-time inventory regardless of this setting. `TERMINAL_MODE` accepts lowercase `auto`, `ask`, or `off`, and defaults to `ask` when it is not set.
 
 ## Starting MinAgent
 
@@ -75,11 +75,11 @@ The final answer streams into a shaded assistant response as tokens arrive. Mark
 
 When `OPENAI_SHOW_REASONING=on` and the endpoint supplies a supported reasoning delta, the reasoning is printed before the final response as muted gray text without a separate panel or background. If the endpoint does not supply that field, MinAgent continues to show `Processing...` and the final response normally.
 
-The model chooses when it needs workspace contents. The workspace inventory provides paths, but MinAgent does not force an initial `read_file` call merely because files exist. When a request depends on project files, the model should call `read_file` before planning, diagnosing, or changing them. It can call `list_directory` to inspect a specific directory's immediate entries; the tool includes hidden entries, does not recurse, and returns at most 500 entries by default. After an edit or write, it must read the result back; a failed edit requires rereading the same file before retrying.
+The model chooses when it needs workspace contents. With `WORKSPACE_LIST_LIMIT=0`, no recursive inventory is injected and `@` file autocomplete is disabled; the model can call `list_directory` to inspect a specific directory's immediate entries. Otherwise, the inventory supplies paths but no file contents. MinAgent does not force an initial `read_file` call merely because files exist. When a request depends on project files, the model should call `read_file` before planning, diagnosing, or changing them. `list_directory` includes hidden entries, does not recurse, and returns at most 500 entries by default. After an edit or write, it must read the result back; a failed edit requires rereading the same file before retrying.
 
 MinAgent verifies successful writes itself and keeps required model readbacks pending across failed turns. `/new` resets that pending state and reports any paths that were left unverified. A model response may request at most 16 tool calls; a turn may use at most 32 tool rounds.
 
-The inventory is refreshed before each model request. If the workspace root contains `AGENTS.md`, it is reloaded before each request and included as project guidance up to 64 KiB. The inventory lists paths and entry types; it does not contain file contents.
+When enabled, the inventory is refreshed before each model request. If the workspace root contains `AGENTS.md`, its content is reloaded before each request and included as project guidance up to 64 KiB, whether or not the inventory is enabled.
 
 ## Input, multiline text, and file attachments
 
@@ -96,7 +96,7 @@ Set `NO_COLOR` to disable terminal colors.
 Type `/` to open command autocomplete. Use ↑/↓ to choose a command and Enter to complete it in the current line; press Enter again to run it. The available commands are:
 
 - `/compact [instructions]`: summarize older conversation history and keep the recent messages.
-- `/init [focus]`: inspect selected project files, show which files were selected, and create or update the workspace root `AGENTS.md`. It reads up to 24 files, with excerpt and total-size limits.
+- `/init [focus]`: inspect a one-time workspace inventory and selected project files, show which files were selected, and create or update the workspace root `AGENTS.md`. It reads up to 24 files, with excerpt and total-size limits.
 - `/new`: clear the screen and start a new conversation.
 - `/exit`: close MinAgent.
 

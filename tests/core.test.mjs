@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { createWorkspaceAccess } from "../src/workspace.mjs";
+import { parseDirectoryEntryLimit } from "../src/config.mjs";
 import { collectProjectEssentials } from "../src/init-project.mjs";
 import { createFileChangeTracker } from "../src/tool-state.mjs";
 import { readStreamingResponse } from "../src/openai.mjs";
@@ -68,6 +69,21 @@ test("inventory excludes generated directories and obeys the listing limit", asy
 	assert.deepEqual(complete.files, ["src/main.mjs"]);
 	const empty = await createWorkspaceAccess(root, "test", 0).refreshInventory();
 	assert.deepEqual(empty.files, []);
+});
+
+test("disabled inventory still loads AGENTS.md and permits a one-time full listing", async (t) => {
+	const root = await temporaryWorkspace(t);
+	await writeFile(join(root, "AGENTS.md"), "Project guidance");
+	await writeFile(join(root, "README.md"), "Project");
+	assert.equal(parseDirectoryEntryLimit(undefined), 0);
+	const access = createWorkspaceAccess(root, "test", 0);
+	const normal = await access.refreshInventory();
+	assert.equal(normal.snapshot, "");
+	assert.deepEqual(normal.files, []);
+	assert.match(normal.agentsContext, /Project guidance/);
+	const forInit = await access.refreshInventory({ includeSnapshot: true, listLimitOverride: -1 });
+	assert.match(forInit.snapshot, /\[FILE\] README\.md/);
+	assert.ok(forInit.files.includes("README.md"));
 });
 
 test("oversized AGENTS.md is omitted from model guidance", async (t) => {

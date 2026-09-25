@@ -35,11 +35,11 @@ export function parsePositiveInteger(value, name, fallback) {
 }
 
 export function parseDirectoryEntryLimit(value) {
-	if (value === undefined || value.trim() === "") return -1;
+	if (value === undefined || value.trim() === "") return 0;
 	const normalized = value.trim();
-	if (!/^-?\d+$/.test(normalized)) throw new Error("WORKSPACE_LIST_LIMIT must be -1 or a non-negative integer.");
+	if (!/^-?\d+$/.test(normalized)) throw new Error("WORKSPACE_LIST_LIMIT must be 0, -1, or a positive integer.");
 	const parsed = Number(normalized);
-	if (!Number.isSafeInteger(parsed) || parsed < -1) throw new Error("WORKSPACE_LIST_LIMIT must be -1 or a non-negative integer.");
+	if (!Number.isSafeInteger(parsed) || parsed < -1) throw new Error("WORKSPACE_LIST_LIMIT must be 0, -1, or a positive integer.");
 	return parsed;
 }
 

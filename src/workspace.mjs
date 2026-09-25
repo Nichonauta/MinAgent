@@ -447,18 +447,19 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 		return `Deleted directory ${args.path} and its contents.`;
 	}
 
-	async function refreshInventory() {
-		const lines = [
-			"## Current workspace inventory (refreshed before each model request; common generated directories are excluded)",
-			`Current directory: ${workspaceName}`,
-			`Per-directory listing limit: ${listLimit === -1 ? "unlimited" : listLimit}`,
-		];
+	async function refreshInventory({ includeSnapshot = listLimit !== 0, listLimitOverride = listLimit } = {}) {
+		const traversalLimit = listLimitOverride;
+		const lines = includeSnapshot ? [
+			"## Workspace inventory (paths only; generated directories excluded)",
+			`Per-directory limit: ${listLimitOverride === -1 ? "unlimited" : listLimitOverride}`,
+		] : [];
 		const filePaths = [];
 		let omittedEntries = 0;
 		let visitedEntries = 0;
 		let listedChars = lines.join("\n").length;
 		let inventoryFull = false;
 		function addLine(line) {
+			if (!includeSnapshot) return;
 			if (listedChars + line.length + 1 > MAX_INVENTORY_CHARS) {
 				inventoryFull = true;
 				return;
@@ -467,7 +468,7 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 			listedChars += line.length + 1;
 		}
 		async function appendDirectory(directoryPath, indent) {
-			if (inventoryFull || visitedEntries >= MAX_INVENTORY_ENTRIES) return;
+			if ((includeSnapshot && inventoryFull) || visitedEntries >= MAX_INVENTORY_ENTRIES) return;
 			let entries;
 			try {
 				entries = await readdir(directoryPath, { withFileTypes: true });
@@ -477,10 +478,10 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 			}
 			entries = entries.filter((entry) => !(entry.isDirectory() && EXCLUDED_DIRECTORIES.has(entry.name.toLowerCase())));
 			entries.sort((left, right) => left.name.localeCompare(right.name));
-			const visibleEntries = listLimit === -1 ? entries : entries.slice(0, listLimit);
+			const visibleEntries = traversalLimit === -1 ? entries : entries.slice(0, traversalLimit);
 			omittedEntries += entries.length - visibleEntries.length;
 			for (const entry of visibleEntries) {
-				if (inventoryFull || visitedEntries >= MAX_INVENTORY_ENTRIES) {
+				if ((includeSnapshot && inventoryFull) || visitedEntries >= MAX_INVENTORY_ENTRIES) {
 					inventoryFull = true;
 					break;
 				}
@@ -499,10 +500,10 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 				}
 			}
 		}
-		await appendDirectory(rootDirectory, "");
-		if (omittedEntries > 0) lines.push(`[${omittedEntries} entries omitted by WORKSPACE_LIST_LIMIT]`);
-		if (inventoryFull) lines.push(`[Inventory stopped at ${MAX_INVENTORY_ENTRIES} entries or ${MAX_INVENTORY_CHARS} characters.]`);
-		let guidance = "## AGENTS.md project guidance\nNo AGENTS.md exists at the workspace root.";
+		if (traversalLimit !== 0) await appendDirectory(rootDirectory, "");
+		if (includeSnapshot && omittedEntries > 0) lines.push(`[${omittedEntries} entries omitted by WORKSPACE_LIST_LIMIT]`);
+		if (includeSnapshot && inventoryFull) lines.push(`[Inventory stopped at ${MAX_INVENTORY_ENTRIES} entries or ${MAX_INVENTORY_CHARS} characters.]`);
+		let guidance = "";
 		let agentsContent = "";
 		let agentsExists = false;
 		try {
@@ -510,7 +511,7 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 			await assertPath(target);
 			const entry = await lstat(target);
 			if (!entry.isFile() || entry.nlink > 1) {
-				guidance = "## AGENTS.md project guidance\nAGENTS.md exists at the workspace root but is not a regular unlinked file.";
+				guidance = "## AGENTS.md project guidance\nAGENTS.md is not a regular unlinked file and could not be loaded.";
 			} else if (entry.size > MAX_AGENTS_BYTES) {
 				guidance = `## AGENTS.md project guidance\nAGENTS.md exceeds the ${MAX_AGENTS_BYTES} byte limit.`;
 			} else {
@@ -524,7 +525,7 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 			if (error?.code !== "ENOENT") guidance = `## AGENTS.md project guidance\nCould not load AGENTS.md: ${error?.code || error.message}`;
 		}
 		return {
-			snapshot: lines.join("\n"),
+			snapshot: includeSnapshot ? lines.join("\n") : "",
 			files: filePaths.sort((left, right) => left.localeCompare(right)),
 			agentsContext: guidance,
 			agentsContent,
