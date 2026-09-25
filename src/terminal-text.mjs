@@ -36,6 +36,21 @@ export function terminalTextWidth(value) {
 	return graphemes(value).reduce((width, cluster) => width + terminalCharacterWidth(cluster), 0);
 }
 
+export function truncateTerminalText(value, maxWidth) {
+	const safe = safeTerminalText(value);
+	if (terminalTextWidth(safe) <= maxWidth) return safe;
+	if (maxWidth < 1) return "";
+	let output = "";
+	let width = 0;
+	for (const cluster of graphemes(safe)) {
+		const nextWidth = terminalCharacterWidth(cluster);
+		if (width + nextWidth > maxWidth - 1) break;
+		output += cluster;
+		width += nextWidth;
+	}
+	return `${output.trimEnd()}…`;
+}
+
 export function wrapTextLine(value, width) {
 	let remaining = graphemes(value);
 	const lines = [];

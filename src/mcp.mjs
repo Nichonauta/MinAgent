@@ -311,7 +311,9 @@ class McpStdioClient {
 
 	notify(method, params) {
 		if (!this.child?.stdin.writable) return;
-		this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method, ...(params ? { params } : {}) })}\n`);
+		this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method, ...(params ? { params } : {}) })}\n`, (error) => {
+			if (error) this.fail(error);
+		});
 	}
 
 	async listTools() {
@@ -417,8 +419,8 @@ class McpHttpClient {
 		});
 		const sessionId = response.headers.get("mcp-session-id");
 		if (sessionId) this.sessionId = sessionId;
-		const body = await readLimitedResponseText(response, 16 * 1024 * 1024);
 		if (!response.ok) {
+			const body = await readLimitedResponseText(response, 16 * 1024 * 1024);
 			let detail = body.slice(0, 1000);
 			try {
 				const parsed = JSON.parse(body);
@@ -426,12 +428,21 @@ class McpHttpClient {
 			} catch {}
 			throw new Error(`MCP HTTP ${response.status}: ${detail || response.statusText}`);
 		}
-		if (id === undefined) return undefined;
-		if (!body.trim()) throw new Error(`MCP server returned an empty response for ${message.method}.`);
+		if (id === undefined) {
+			await response.body?.cancel().catch(() => {});
+			return undefined;
+		}
 		const contentType = response.headers.get("content-type")?.toLowerCase() || "";
-		const messages = contentType.includes("text/event-stream") ? parseSseMessages(body) : [JSON.parse(body)];
-		const result = messages.find((item) => String(item?.id) === String(id));
+		let result;
+		if (contentType.includes("text/event-stream")) {
+			result = await readSseResponse(response, id, 16 * 1024 * 1024);
+		} else {
+			const body = await readLimitedResponseText(response, 16 * 1024 * 1024);
+			if (!body.trim()) throw new Error(`MCP server returned an empty response for ${message.method}.`);
+			result = JSON.parse(body);
+		}
 		if (!result) throw new Error(`MCP server did not return a response for ${message.method}.`);
+		if (String(result.id) !== String(id)) throw new Error(`MCP server returned the wrong response ID for ${message.method}.`);
 		if (result.error) throw new Error(result.error.message || "MCP request failed.");
 		return result.result;
 	}
@@ -486,19 +497,40 @@ async function readLimitedResponseText(response, maxBytes) {
 	return Buffer.concat(chunks, totalBytes).toString("utf8");
 }
 
-function parseSseMessages(source) {
-	const messages = [];
-	for (const event of source.split(/\r?\n\r?\n/)) {
-		const data = event.split(/\r?\n/)
-			.filter((line) => line.startsWith("data:"))
-			.map((line) => line.slice(5).trimStart())
-			.join("\n");
-		if (!data.trim()) continue;
-		try {
-			messages.push(JSON.parse(data));
-		} catch {
-			throw new Error("MCP server sent an invalid JSON-RPC event.");
+async function readSseResponse(response, id, maxBytes) {
+	if (!response.body) throw new Error("MCP server returned an empty event stream.");
+	const reader = response.body.getReader();
+	const decoder = new TextDecoder();
+	let buffer = "";
+	let totalBytes = 0;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			totalBytes += value.byteLength;
+			if (totalBytes > maxBytes) throw new Error(`MCP HTTP response exceeds ${maxBytes} bytes.`);
+			buffer += decoder.decode(value, { stream: true });
+			let boundary;
+			while ((boundary = /\r?\n\r?\n/.exec(buffer)) !== null) {
+				const frame = buffer.slice(0, boundary.index);
+				buffer = buffer.slice(boundary.index + boundary[0].length);
+				const data = frame.split(/\r?\n/)
+					.filter((line) => line.startsWith("data:"))
+					.map((line) => line.slice(5).trimStart())
+					.join("\n");
+				if (!data.trim()) continue;
+				let message;
+				try {
+					message = JSON.parse(data);
+				} catch {
+					throw new Error("MCP server sent an invalid JSON-RPC event.");
+				}
+				if (String(message?.id) === String(id)) return message;
+			}
 		}
+		throw new Error("MCP server closed the event stream before returning the requested response.");
+	} finally {
+		await reader.cancel().catch(() => {});
+		reader.releaseLock();
 	}
-	return messages;
 }

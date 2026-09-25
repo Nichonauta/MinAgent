@@ -175,5 +175,16 @@ export async function readStreamingResponse(response, onTextDelta, maxResponseBy
 	if (toolCalls.size > 0) message.tool_calls = [...toolCalls.entries()]
 		.sort(([left], [right]) => left - right)
 		.map(([, call]) => call);
+	if (finishReason === "length") throw new Error("Endpoint stopped at its output token limit; the partial response was discarded.");
+	if (finishReason === "content_filter") throw new Error("Endpoint stopped the response because of its content filter.");
+	for (const call of message.tool_calls ?? []) {
+		if (!call.id || !call.function.name) throw new Error("Endpoint returned an incomplete tool call.");
+		try {
+			const args = JSON.parse(call.function.arguments);
+			if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error();
+		} catch {
+			throw new Error(`Endpoint returned invalid arguments for tool ${call.function.name}.`);
+		}
+	}
 	return { payload: { usage, finish_reason: finishReason }, message };
 }

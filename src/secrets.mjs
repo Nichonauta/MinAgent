@@ -6,7 +6,7 @@ function isSecretName(value) {
 		.toLowerCase()
 		.split(/[^a-z0-9]+/)
 		.filter(Boolean);
-	return words.some((word) => ["token", "secret", "password", "passwd", "credential"].includes(word))
+	return words.some((word) => ["token", "secret", "password", "passwd", "credential", "authorization", "cookie"].includes(word))
 		|| words.some((word, index) => word === "key" && ["api", "access", "private", "client"].includes(words[index - 1]));
 }
 

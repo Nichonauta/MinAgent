@@ -50,6 +50,33 @@ export function serializeForSummary(conversationMessages) {
 	}).join("\n\n");
 }
 
+export function chunkSummaryTranscript(conversationMessages, maxChars) {
+	if (!Number.isSafeInteger(maxChars) || maxChars < 256) throw new Error("Summary chunk size must be at least 256 characters.");
+	const chunks = [];
+	let current = "";
+	for (const message of conversationMessages) {
+		let remaining = serializeForSummary([message]);
+		while (remaining) {
+			const separator = current ? "\n\n" : "";
+			const available = maxChars - current.length - separator.length;
+			if (available <= 0) {
+				chunks.push(current);
+				current = "";
+				continue;
+			}
+			const part = remaining.slice(0, available);
+			current += separator + part;
+			remaining = remaining.slice(part.length);
+			if (remaining) {
+				chunks.push(current);
+				current = "";
+			}
+		}
+	}
+	if (current) chunks.push(current);
+	return chunks;
+}
+
 export function findCompactionCutPoint(conversationMessages, keepRecentTokens, imageTokenEstimate = 4800) {
 	const cutPoints = [];
 	for (let index = 0; index < conversationMessages.length; index += 1) {

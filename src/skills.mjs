@@ -1,10 +1,47 @@
-import { lstat, readdir, readFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, open, readdir, realpath } from "node:fs/promises";
 import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 
 const MAX_SKILL_BYTES = 96 * 1024;
 const MAX_RESOURCE_BYTES = 64 * 1024;
 const MAX_SKILLS = 24;
 const MAX_SKILL_CONTEXT_CHARS = 32 * 1024;
+
+async function readSkillText(target, maxBytes, rootDirectory) {
+	const rootBefore = await lstat(rootDirectory);
+	if (rootBefore.isSymbolicLink() || !rootBefore.isDirectory()) throw new Error("Skill directory is no longer a regular directory.");
+	const before = await lstat(target);
+	if (before.isSymbolicLink() || !before.isFile() || before.nlink > 1) throw new Error("Skill text must be a regular, unlinked file.");
+	if (before.size > maxBytes) throw new Error(`Skill text exceeds ${maxBytes} bytes.`);
+	const handle = await open(target, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
+	try {
+		const opened = await handle.stat();
+		if (!opened.isFile() || opened.nlink > 1 || opened.dev !== before.dev || opened.ino !== before.ino) {
+			throw new Error("Skill file changed while it was being opened.");
+		}
+		const root = await realpath(rootDirectory);
+		const resolved = await realpath(target);
+		const relativePath = relative(root, resolved);
+		if (relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) {
+			throw new Error("Skill file resolved outside its directory.");
+		}
+		const buffer = await handle.readFile();
+		if (buffer.length > maxBytes) throw new Error(`Skill text exceeds ${maxBytes} bytes.`);
+		const after = await lstat(target);
+		const rootAfter = await lstat(rootDirectory);
+		if (!rootAfter.isDirectory() || rootAfter.dev !== rootBefore.dev || rootAfter.ino !== rootBefore.ino) {
+			throw new Error("Skill directory changed while it was being read.");
+		}
+		if (!after.isFile() || after.nlink > 1 || after.dev !== opened.dev || after.ino !== opened.ino
+			|| after.size !== opened.size || after.mtimeMs !== opened.mtimeMs) {
+			throw new Error("Skill file changed while it was being read.");
+		}
+		if (buffer.includes(0)) throw new Error("Skill text cannot contain binary data.");
+		return new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+	} finally {
+		await handle.close();
+	}
+}
 
 export async function discoverSkills(skillRoots) {
 	const skills = [];
@@ -48,16 +85,7 @@ export async function discoverSkills(skillRoots) {
 			const skillDirectory = resolve(root, entry.name);
 			const skillFile = resolve(skillDirectory, "SKILL.md");
 			try {
-				const fileEntry = await lstat(skillFile);
-				if (fileEntry.isSymbolicLink() || !fileEntry.isFile() || fileEntry.nlink > 1) {
-					warnings.push(`Skipping unsafe skill file: ${skillFile}`);
-					continue;
-				}
-				if (fileEntry.size > MAX_SKILL_BYTES) {
-					warnings.push(`Skipping oversized skill file: ${skillFile}`);
-					continue;
-				}
-				const source = await readFile(skillFile, "utf8");
+				const source = await readSkillText(skillFile, MAX_SKILL_BYTES, skillDirectory);
 				const skill = parseSkillFile(source, skillDirectory, entry.name);
 				if (names.has(skill.name)) {
 					warnings.push(`Skipping duplicate skill name "${skill.name}" at ${skillFile}`);
@@ -205,10 +233,6 @@ export async function executeSkillTool(name, args, skills) {
 		const entry = await lstat(current);
 		if (entry.isSymbolicLink() || (entry.isFile() && entry.nlink > 1)) throw new Error("Symbolic links and hard links are blocked in skill resources.");
 	}
-	const entry = await lstat(target);
-	if (!entry.isFile()) throw new Error("Skill resources must be regular files.");
-	if (entry.nlink > 1) throw new Error("Symbolic links and hard links are blocked in skill resources.");
-	if (entry.size > MAX_RESOURCE_BYTES) throw new Error(`Skill resource exceeds the ${MAX_RESOURCE_BYTES} byte limit.`);
-	const content = await readFile(target, "utf8");
+	const content = await readSkillText(target, MAX_RESOURCE_BYTES, skill.directory);
 	return { toolText: `Skill resource ${skill.name}/${args.path}:\n\n${content}`, displayText: `Read skill resource: ${skill.name}/${args.path}` };
 }

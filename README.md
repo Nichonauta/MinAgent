@@ -39,7 +39,7 @@ Boolean settings use only `on` and `off`:
 
 For llama.cpp, use `--reasoning-format deepseek` when the model template does not automatically emit a separate `reasoning_content` channel. MinAgent displays that channel as progress text and keeps the final answer in its normal response presentation.
 
-`OPENAI_INPUT` must contain `text` and may also contain `image`. `OPENAI_CONTEXT_WINDOW` is a positive integer and defaults to `262144` tokens. `WORKSPACE_LIST_LIMIT` defaults to `-1`, which includes every inventory entry; a non-negative value limits the number of entries shown per directory. `TERMINAL_MODE` accepts `Auto`, `Ask`, or `Off`, and defaults to `Ask` when it is not set.
+`OPENAI_INPUT` must contain `text` and may also contain `image`. `OPENAI_CONTEXT_WINDOW` is a positive integer and defaults to `262144` tokens; set it to the actual model context limit. `WORKSPACE_LIST_LIMIT` defaults to `-1`, which lists all entries except common generated directories such as `.git`, `node_modules`, `dist`, and `build`. A non-negative value limits both the entries shown and the paths collected per directory. The inventory stops at 10,000 entries or 128 KiB of text. `TERMINAL_MODE` accepts `Auto`, `Ask`, or `Off`, and defaults to `Ask` when it is not set.
 
 ## Starting MinAgent
 
@@ -49,23 +49,25 @@ PowerShell:
 
 ```powershell
 Set-Location "C:\path\to\your\project"
-& "C:\Users\Usuario\Documents\Desarrollo\MinAgent\minagent.ps1"
+& "C:\path\to\MinAgent\minagent.ps1"
 ```
 
 CMD:
 
 ```bat
 cd /d C:\path\to\your\project
-C:\Users\Usuario\Documents\Desarrollo\MinAgent\minagent.cmd
+C:\path\to\MinAgent\minagent.cmd
 ```
 
 It can also be started directly:
 
 ```powershell
-node "C:\Users\Usuario\Documents\Desarrollo\MinAgent\src\minagent.mjs"
+node "C:\path\to\MinAgent\src\minagent.mjs"
 ```
 
-The workspace is the directory where the command is launched. File tools cannot access paths outside it.
+The workspace is the directory where the command is launched. File tools and image attachments accept paths inside it only. Terminal commands and configured MCP servers run with the user's account permissions.
+
+File tool paths are relative to that directory. If MinAgent is started in `Test`, use `README.md` for `Test/README.md`. A redundant `Test/README.md` also resolves to the root file when there is no real `Test` subdirectory; if one exists, its paths take precedence. Use `./Test/file.txt` to explicitly target or create a same-named subdirectory. Without such a subdirectory, `Test` alone refers to the workspace root and cannot be read as a file or deleted.
 
 ## Conversation and streaming
 
@@ -75,24 +77,26 @@ When `OPENAI_SHOW_REASONING=on` and the endpoint supplies a supported reasoning 
 
 The model chooses when it needs workspace contents. The workspace inventory provides paths, but MinAgent does not force an initial `read_file` call merely because files exist. When a request depends on project files, the model should call `read_file` before planning, diagnosing, or changing them. After an edit or write, it must read the result back; a failed edit requires rereading the same file before retrying.
 
-The inventory is refreshed before each model request. If the workspace root contains `AGENTS.md`, it is reloaded before each request and included as project guidance. The inventory lists paths and entry types; it does not contain file contents.
+MinAgent verifies successful writes itself and keeps required model readbacks pending across failed turns. `/new` resets that pending state and reports any paths that were left unverified. A model response may request at most 16 tool calls; a turn may use at most 32 tool rounds.
+
+The inventory is refreshed before each model request. If the workspace root contains `AGENTS.md`, it is reloaded before each request and included as project guidance up to 64 KiB. The inventory lists paths and entry types; it does not contain file contents.
 
 ## Input, multiline text, and file attachments
 
 Press `Ctrl+J` to insert a newline without sending the message. Multiline text pasted into the prompt keeps its line breaks and does not submit one request per line. Press Enter to send.
 
-Type `@` followed by a filename fragment to search workspace files. Use the arrow keys to select a result and Enter to insert it. Selecting a text file attaches an excerpt of up to 48 KiB. Selecting an image attaches it as multimodal input. Up to eight files and four images can be attached to one message; each file is limited to 10 MiB.
+Type `@` followed by a filename fragment to search workspace files. Use ↑/↓ to select a result and Enter to replace the fragment with its complete path in the current line; press Enter again to submit. Selecting a text file attaches an excerpt of up to 48 KiB. Selecting an image attaches it as multimodal input. Up to eight files and four images can be attached to one message; each file is limited to 10 MiB.
 
-Image paths written directly in a message are detected for PNG, JPEG, GIF, and WebP files. MinAgent attaches the image data and removes the path from the text sent to the model, so the model does not try to read an external image path as if it were a workspace file. The model endpoint must support image input.
+Image paths written directly in a message are detected for PNG, JPEG, GIF, and WebP files inside the workspace. MinAgent attaches the image data and removes the path from the text sent to the model. The model endpoint must support image input.
 
 Set `NO_COLOR` to disable terminal colors.
 
 ## Commands
 
-Type `/` to open command autocomplete. The available commands are:
+Type `/` to open command autocomplete. Use ↑/↓ to choose a command and Enter to complete it in the current line; press Enter again to run it. The available commands are:
 
 - `/compact [instructions]`: summarize older conversation history and keep the recent messages.
-- `/init [focus]`: inspect the most relevant project files and create or update the workspace root `AGENTS.md`.
+- `/init [focus]`: inspect selected project files, show which files were selected, and create or update the workspace root `AGENTS.md`. It reads up to 24 files, with excerpt and total-size limits.
 - `/new`: clear the screen and start a new conversation.
 - `/exit`: close MinAgent.
 
@@ -102,14 +106,14 @@ Compaction also runs automatically as the configured context window fills. The s
 
 The model can use these built-in tools within the workspace root:
 
-- `read_file`: read a UTF-8 text file, or a supported image when image input is enabled. Text output is limited to 300 lines and 48 KiB.
+- `read_file`: read a UTF-8 text file, or a supported image when image input is enabled. Text output is limited to 300 lines and 48 KiB. For a long line, use the returned `offset` and `column` to continue within that line.
 - `edit_file`: replace one exact, unique text block in an existing file.
 - `write_file`: create or atomically replace a UTF-8 file and its missing parent directories.
 - `delete_file`: delete one regular file.
 - `delete_directory`: recursively delete a regular subdirectory after validating its contents.
 - `run_terminal`: available only when `TERMINAL_MODE` is `Auto` or `Ask`. It runs in the workspace directory; `Ask` requires approval for each command.
 
-Read, edit, write, and delete operations reject symbolic links, junctions, hard-linked files, special files, and paths outside the workspace. Individual reads and writes are limited to 10 MiB. The workspace root cannot be deleted.
+Read, edit, write, and delete operations check for symbolic links, junctions, hard-linked files, special files, and paths outside the workspace. They also check file identity and changes around reads and replacements. Individual reads and writes are limited to 10 MiB. The workspace root cannot be deleted. A successful edit or write is reread and compared with the requested content before the tool reports success. As with other path-based Node.js file operations, an untrusted process that concurrently swaps parent directories can still race a rename or deletion; use a workspace directory tree that other untrusted processes cannot modify.
 
 ## Skills
 
@@ -146,17 +150,26 @@ MinAgent discovers the server tools at startup and exposes them to the model. It
 
 ## Project layout
 
-- `src/minagent.mjs`: TUI, conversation loop, tool dispatch, rendering, commands, and attachments.
+- `src/minagent.mjs`: TUI, conversation loop, tool dispatch, and commands.
+- `src/attachments.mjs` and `src/image.mjs`: file attachments and image handling.
+- `src/markdown-terminal.mjs` and `src/terminal-text.mjs`: streaming Markdown and terminal text layout.
+- `src/terminal-command.mjs` and `src/processes.mjs`: terminal execution and process cleanup.
+- `src/tool-state.mjs`: pending file readback and edit-recovery state.
 - `src/openai.mjs`: OpenAI-compatible SSE client, one-hour timeout, tool-call reassembly, and reasoning deltas.
 - `src/config.mjs`: `.env` loading and configuration validation.
 - `src/workspace.mjs`: workspace boundaries and file operations.
 - `src/editor.mjs`: multiline editing, paste handling, and autocomplete.
+- `src/readline-adapter.mjs`: isolated access to Node's interactive readline state.
 - `src/context.mjs`: token estimation, conversation serialization, and compaction.
 - `src/skills.mjs`: local skill discovery and skill tools.
 - `src/mcp.mjs`: MCP configuration, transports, tool discovery, and result handling.
 - `src/init-project.mjs`: project file selection for `/init`.
 - `minagent.cmd` and `minagent.ps1`: Windows launchers.
 
+## Tests
+
+Run `node --test` from the MinAgent directory. The tests use Node.js built-ins and cover workspace files, attachments, context chunking, streaming responses, terminal approval, and a local MCP HTTP server.
+
 ## License and notice
 
-See [NOTICE.md](NOTICE.md) for the attribution notice. The project is a standalone implementation inspired by the Pi agent harness; it does not include Pi source files.
+MinAgent's own code is licensed under the [MIT License](LICENSE). See [NOTICE.md](NOTICE.md) for the Pi attribution. The project is a standalone implementation inspired by the Pi agent harness; it does not include Pi source files.

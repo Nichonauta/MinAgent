@@ -1,13 +1,35 @@
-const MAX_AUTOCOMPLETE_CANDIDATES = 1000;
+import { insertNewline, isBulkInputChunk } from "./readline-adapter.mjs";
+import { safeTerminalText, truncateTerminalText } from "./terminal-text.mjs";
 
-function insertNewline(terminal) {
-	if (typeof terminal?.line !== "string") return;
-	const cursor = Number.isInteger(terminal.cursor) ? Math.max(0, Math.min(terminal.cursor, terminal.line.length)) : terminal.line.length;
-	terminal.line = `${terminal.line.slice(0, cursor)}\n${terminal.line.slice(cursor)}`;
-	terminal.cursor = cursor + 1;
-	const multilineState = Object.getOwnPropertySymbols(terminal).find((symbol) => symbol.description === "_isMultiline");
-	if (multilineState) terminal[multilineState] = true;
-	terminal.prompt(true);
+const MAX_AUTOCOMPLETE_CANDIDATES = 1000;
+export const AUTOCOMPLETE_PANEL_ROWS = 7;
+const AUTOCOMPLETE_MAX_ITEMS = AUTOCOMPLETE_PANEL_ROWS - 2;
+const NAVIGATION_KEYS = new Set(["up", "down", "left", "right", "home", "end", "pageup", "pagedown", "delete", "backspace", "escape"]);
+
+export function formatAutocompletePanel(state, { columns = 80, useColor = false, uiText = (value) => value } = {}) {
+	const title = state.kind === "file" ? "Files" : "Commands";
+	const lines = [uiText(`  ┌─ ${title.toUpperCase()} · ${state.totalMatches} match${state.totalMatches === 1 ? "" : "es"}`, state.kind === "file" ? "cyan" : "magenta", true)];
+	const firstVisibleIndex = Math.max(0, Math.min(
+		state.selectedIndex - Math.floor(AUTOCOMPLETE_MAX_ITEMS / 2),
+		state.candidates.length - AUTOCOMPLETE_MAX_ITEMS,
+	));
+	for (let visibleIndex = 0; visibleIndex < AUTOCOMPLETE_MAX_ITEMS; visibleIndex += 1) {
+		const index = firstVisibleIndex + visibleIndex;
+		const candidate = state.candidates[index];
+		if (!candidate) {
+			lines.push("");
+			continue;
+		}
+		const marker = index === state.selectedIndex ? "›" : " ";
+		const label = safeTerminalText(candidate.label).replace(/\s+/g, " ");
+		const shown = truncateTerminalText(label, Math.max(1, columns - 6));
+		const option = `  ${marker} ${shown}`;
+		lines.push(index === state.selectedIndex
+			? (useColor ? `\u001b[48;2;32;93;112;38;2;226;239;241m${safeTerminalText(option)}\u001b[0m` : option)
+			: uiText(option, "muted"));
+	}
+	lines.push(uiText("  └─ ↑/↓ select · Enter complete · Esc close", "muted"));
+	return lines;
 }
 
 function suppressReadlineKey(key) {
@@ -17,12 +39,6 @@ function suppressReadlineKey(key) {
 	key.meta = false;
 }
 
-function isBulkInputChunk(terminal) {
-	if (terminal?.isCompletionEnabled === false) return true;
-	const sawKeyPress = Object.getOwnPropertySymbols(terminal ?? {}).find((symbol) => symbol.description === "_sawKeyPress");
-	return Boolean(sawKeyPress && terminal[sawKeyPress] === false);
-}
-
 function clearPendingLineFeed(state) {
 	state.skipNextLineFeed = false;
 	if (state.lineFeedTimer) clearTimeout(state.lineFeedTimer);
@@ -30,7 +46,9 @@ function clearPendingLineFeed(state) {
 }
 
 export function handlePastedInput(key, character, terminal, state) {
-	state.bulkInputChunk = isBulkInputChunk(terminal);
+	// Readline marks escape sequences as bulk chunks before its own keypress listener runs.
+	// Arrow keys are still single physical keypresses and must reach autocomplete.
+	state.bulkInputChunk = !NAVIGATION_KEYS.has(key?.name) && isBulkInputChunk(terminal);
 	if (key?.name === "paste-start") {
 		state.active = true;
 		clearPendingLineFeed(state);
@@ -79,6 +97,7 @@ export function handleControlJInput(key, character, terminal) {
 
 export function buildAutocompleteState(line, cursor, workspaceFiles, slashCommands) {
 	const prefix = line.slice(0, cursor);
+	const tokenEnd = cursor + (line.slice(cursor).match(/^[^\s]*/)?.[0].length ?? 0);
 	const commandMatch = prefix.match(/^(\s*)\/([^\s]*)$/);
 	if (commandMatch) {
 		const query = commandMatch[2].toLowerCase();
@@ -91,7 +110,7 @@ export function buildAutocompleteState(line, cursor, workspaceFiles, slashComman
 			line,
 			cursor,
 			start: commandMatch[1].length,
-			end: cursor,
+			end: tokenEnd,
 			query,
 			candidates,
 			totalMatches: candidates.length,
@@ -111,13 +130,30 @@ export function buildAutocompleteState(line, cursor, workspaceFiles, slashComman
 		line,
 		cursor,
 		start: atIndex,
-		end: cursor,
+		end: tokenEnd,
 		query,
 		trailingSpace: rawQuery.length > query.length,
 		candidates,
 		totalMatches: ranked.totalMatches,
 		selectedIndex: 0,
 	};
+}
+
+export function handleAutocompleteKeypress(state, key, terminal) {
+	if (!state?.candidates.length || !key || terminal.line !== state.line || terminal.cursor !== state.cursor) return null;
+	if (key.name === "up" || key.name === "down") {
+		const direction = key.name === "up" ? -1 : 1;
+		suppressReadlineKey(key);
+		state.selectedIndex = (state.selectedIndex + direction + state.candidates.length) % state.candidates.length;
+		return { kind: "move" };
+	}
+	if ((key.name !== "return" && key.name !== "enter") || key.ctrl || key.meta) return null;
+	suppressReadlineKey(key);
+	const selected = state.candidates[state.selectedIndex] ?? state.candidates[0];
+	const replacement = state.kind === "file" && state.trailingSpace ? `${selected.value} ` : selected.value;
+	terminal.line = `${state.line.slice(0, state.start)}${replacement}${state.line.slice(state.end)}`;
+	terminal.cursor = state.start + replacement.length;
+	return { kind: "complete", selectedFile: state.kind === "file" ? selected.value : null };
 }
 
 export function rankWorkspaceFiles(query, workspaceFiles) {

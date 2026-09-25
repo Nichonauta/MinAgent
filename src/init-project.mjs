@@ -1,6 +1,5 @@
-import { readdir, readFile, stat } from "node:fs/promises";
-import { join, relative, sep } from "node:path";
-import { MAX_READ_BYTES } from "./workspace.mjs";
+import { readdir } from "node:fs/promises";
+import { basename, extname, join, relative, sep } from "node:path";
 import { redactLikelySecrets } from "./secrets.mjs";
 
 const MAX_FILES = 24;
@@ -16,26 +15,33 @@ const PRIORITY_FILES = new Map([
 ]);
 const SOURCE_EXTENSIONS = /\.(?:c|cc|cpp|cs|go|h|hpp|java|js|jsx|mjs|cjs|php|py|rb|rs|sh|sql|swift|ts|tsx|vue|svelte|html|css)$/i;
 const TEXT_EXTENSIONS = /\.(?:md|txt|json|toml|ya?ml|xml|gradle|properties|c|cc|cpp|cs|go|h|hpp|java|js|jsx|mjs|cjs|php|py|rb|rs|sh|sql|swift|ts|tsx|vue|svelte|html|css)$/i;
-const PROJECT_DIRECTORIES = new Set(["src", "app", "lib", "cmd", "server", "client", "packages", "apps", "pages", "api", "web", "backend", "frontend"]);
+const PROJECT_DIRECTORIES = new Set(["src", "app", "lib", "cmd", "server", "client", "packages", "apps", "pages", "api", "web", "backend", "frontend", "tests", "test", "__tests__"]);
 
-export function initCandidateScore(name, nestedDepth) {
+export function initCandidateScore(name, nestedDepth, projectName = "") {
 	const lowerName = name.toLowerCase();
 	if (lowerName === "agents.md" || lowerName.startsWith(".env") || lowerName.endsWith(".lock")) return null;
 	if (/(?:secret|credential|private[-_.]?key)/i.test(name)) return null;
 	const priority = PRIORITY_FILES.get(lowerName);
 	if (priority !== undefined) return priority + nestedDepth * 3;
 	if (!TEXT_EXTENSIONS.test(name)) return null;
-	if (!SOURCE_EXTENSIONS.test(name) || /(?:^|[._-])(?:test|spec)(?:[._-]|$)/i.test(name)) return null;
+	if (!SOURCE_EXTENSIONS.test(name)) return null;
+	if (projectName && basename(lowerName, extname(lowerName)).replace(/[^a-z0-9]/g, "") === projectName) return 4 + nestedDepth * 3;
+	if (/(?:^|[._-])(?:test|spec)(?:[._-]|$)/i.test(name)) return 11 + nestedDepth * 3;
 	if (/^(?:index|main|app|server|cli|lib)\.[^.]+$/i.test(name)) return 5 + nestedDepth * 3;
 	if (nestedDepth <= 1 && /^(?:vite|next|webpack|rollup|eslint|prettier|postcss)\.config\.[^.]+$/i.test(name)) return 8;
-	return null;
+	// An unfamiliar entry point is still more useful than an inventory alone.
+	return SOURCE_EXTENSIONS.test(name) ? 12 + nestedDepth * 3 : null;
 }
 
-export async function collectProjectEssentials({ rootDirectory, resolveWorkspacePath, assertWorkspacePath }) {
+export async function collectProjectEssentials({ rootDirectory, readWorkspaceRaw, maxTotalChars = MAX_TOTAL_CHARS }) {
+	if (typeof readWorkspaceRaw !== "function") throw new Error("A workspace file reader is required for /init.");
+	if (!Number.isSafeInteger(maxTotalChars) || maxTotalChars < 512) throw new Error("/init requires a larger project file budget.");
+	const totalLimit = Math.min(MAX_TOTAL_CHARS, maxTotalChars);
+	const projectName = basename(rootDirectory).toLowerCase().replace(/[^a-z0-9]/g, "");
 	const candidates = new Map();
 	const addCandidate = (path, name, depth) => {
 		const relativePath = relative(rootDirectory, path).split(sep).join("/");
-		const score = initCandidateScore(name, depth);
+		const score = initCandidateScore(name, depth, projectName);
 		if (score === null) return;
 		candidates.set(relativePath, Math.min(candidates.get(relativePath) ?? Number.POSITIVE_INFINITY, score));
 	};
@@ -73,20 +79,18 @@ export async function collectProjectEssentials({ rootDirectory, resolveWorkspace
 	const selected = [...candidates.entries()]
 		.sort((left, right) => left[1] - right[1] || left[0].localeCompare(right[0]))
 		.slice(0, MAX_FILES);
+	const fileExcerptLimit = Math.min(MAX_FILE_CHARS, Math.max(512, Math.floor(totalLimit / Math.min(selected.length || 1, 8))));
 	const files = [];
 	let totalChars = 0;
 	for (const [relativePath] of selected) {
-		if (totalChars >= MAX_TOTAL_CHARS) break;
-		const target = resolveWorkspacePath(relativePath);
+		if (totalChars >= totalLimit) break;
 		try {
-			await assertWorkspacePath(target);
-			const info = await stat(target);
-			if (!info.isFile() || info.size > MAX_READ_BYTES || info.nlink > 1) continue;
-			const fullContent = await readFile(target, "utf8");
+			const buffer = await readWorkspaceRaw(relativePath);
+			const fullContent = new TextDecoder("utf-8", { fatal: true }).decode(buffer);
 			if (fullContent.includes("\0")) continue;
 			const safeContent = redactLikelySecrets(fullContent);
-			const remaining = MAX_TOTAL_CHARS - totalChars;
-			const excerpt = safeContent.slice(0, Math.min(MAX_FILE_CHARS, remaining));
+			const remaining = totalLimit - totalChars;
+			const excerpt = safeContent.slice(0, Math.min(fileExcerptLimit, remaining));
 			files.push({ path: relativePath, content: excerpt, truncated: excerpt.length < safeContent.length });
 			totalChars += excerpt.length;
 		} catch {
