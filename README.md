@@ -65,9 +65,9 @@ It can also be started directly:
 node "C:\path\to\MinAgent\src\minagent.mjs"
 ```
 
-The workspace is the directory where the command is launched. File tools and image attachments accept paths inside it only. Terminal commands and configured MCP servers run with the user's account permissions.
+The workspace is the directory where the command is launched. `list_directory`, file changes, and image attachments are confined to it. `read_file` can also read one specifically named file outside it, but cannot list outside directories. Terminal commands and configured MCP servers run with the user's account permissions.
 
-File tool paths are relative to that directory. If MinAgent is started in `Test`, use `README.md` for `Test/README.md`. A redundant `Test/README.md` also resolves to the root file when there is no real `Test` subdirectory; if one exists, its paths take precedence. Use `./Test/file.txt` to explicitly target or create a same-named subdirectory. Without such a subdirectory, `Test` alone refers to the workspace root and cannot be read as a file or deleted.
+File paths are relative to that directory. To read a file outside it, pass its explicit absolute path or a relative path such as `../notes.txt` to `read_file`; outside directories cannot be listed and other file tools cannot change them. If MinAgent is started in `Test`, use `README.md` for `Test/README.md`. A redundant `Test/README.md` also resolves to the root file when there is no real `Test` subdirectory; if one exists, its paths take precedence. Use `./Test/file.txt` to explicitly target or create a same-named subdirectory. Without such a subdirectory, `Test` alone refers to the workspace root and cannot be read as a file or deleted.
 
 ## Conversation and streaming
 
@@ -105,9 +105,9 @@ Compaction also runs automatically as the configured context window fills. The s
 
 ## Workspace tools
 
-The model can use these built-in tools within the workspace root:
+The model can use these built-in tools; directory listings and file changes stay within the workspace root:
 
-- `read_file`: read a UTF-8 text file, or a supported image when image input is enabled. Text output is limited to 300 lines and 48 KiB. For a long line, use the returned `offset` and `column` to continue within that line.
+- `read_file`: read a specifically named UTF-8 text file inside or outside the workspace, or a supported image when image input is enabled. It cannot list directories. Text output is limited to 300 lines and 48 KiB. For a long line, use the returned `offset` and `column` to continue within that line.
 - `list_directory`: list immediate files and subdirectories, including hidden entries, without recursion. It defaults to the workspace root and 500 entries; pass a workspace-relative `path` or a larger `limit` when needed. Output is capped at 50 KiB and 10,000 entries; symbolic links are shown but never followed.
 - `edit_file`: replace one exact, unique text block in an existing file.
 - `write_file`: create or atomically replace a UTF-8 file and its missing parent directories.
@@ -115,7 +115,7 @@ The model can use these built-in tools within the workspace root:
 - `delete_directory`: recursively delete a regular subdirectory after validating its contents.
 - `run_terminal`: available only when `TERMINAL_MODE` is `auto` or `ask`. It runs in the workspace directory; `ask` requires approval for each command.
 
-Read, edit, write, and delete operations check for symbolic links, junctions, hard-linked files, special files, and paths outside the workspace. They also check file identity and changes around reads and replacements. Individual reads and writes are limited to 10 MiB. The workspace root cannot be deleted. A successful edit or write is reread and compared with the requested content before the tool reports success. As with other path-based Node.js file operations, an untrusted process that concurrently swaps parent directories can still race a rename or deletion; use a workspace directory tree that other untrusted processes cannot modify.
+Reads check file identity and changes around opening and reading. `read_file` can read only a specifically named outside file; outside directories cannot be discovered through `list_directory`, and edit, write, and delete tools remain confined to the workspace. Within the workspace, file operations check for symbolic links, junctions, hard-linked files, special files, and paths outside the workspace. Individual reads and writes are limited to 10 MiB. The workspace root cannot be deleted. A successful edit or write is reread and compared with the requested content before the tool reports success. As with other path-based Node.js file operations, an untrusted process that concurrently swaps parent directories can still race a rename or deletion; use a workspace directory tree that other untrusted processes cannot modify.
 
 ## Skills
 

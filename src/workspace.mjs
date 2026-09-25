@@ -10,7 +10,7 @@ import {
 	rename,
 	unlink,
 } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, parse as parsePath, relative, resolve, sep } from "node:path";
 import { detectImageMimeType } from "./image.mjs";
 
 export const MAX_READ_BYTES = 10 * 1024 * 1024;
@@ -30,13 +30,13 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 		return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 	}
 
-	function resolvePath(input) {
+	function resolvePath(input, { allowOutside = false } = {}) {
 		if (typeof input !== "string" || input.length === 0 || input.includes("\0")) {
 			throw new Error("A non-empty file path is required.");
 		}
 		const absolute = isAbsolute(input);
 		let candidate = absolute ? resolve(input) : resolve(rootDirectory, input);
-		if (!isWithinRoot(candidate)) throw new Error("Path is outside the current workspace.");
+		if (!allowOutside && !isWithinRoot(candidate)) throw new Error("Path is outside the current workspace.");
 		const explicitlyRelative = /^\.[\\/]/.test(input);
 		if (!absolute && !explicitlyRelative) {
 			const parts = input.split(process.platform === "win32" ? /[\\/]/ : /\//).filter((part) => part && part !== ".");
@@ -55,9 +55,11 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 				if (!childExists) candidate = resolve(rootDirectory, ...parts.slice(1));
 			}
 		}
-		if (!isWithinRoot(candidate)) throw new Error("Path is outside the current workspace.");
+		if (!allowOutside && !isWithinRoot(candidate)) throw new Error("Path is outside the current workspace.");
 		if (process.platform === "win32") {
-			const parts = relative(rootDirectory, candidate).split(/[\\/]/).filter(Boolean);
+			if (/^[\\/]{2}[?.][\\/]/.test(input)) throw new Error("Windows device paths are not allowed.");
+			const baseDirectory = isWithinRoot(candidate) ? rootDirectory : parsePath(candidate).root;
+			const parts = relative(baseDirectory, candidate).split(/[\\/]/).filter(Boolean);
 			for (const part of parts) {
 				if (part.includes(":") || /[. ]$/.test(part)) throw new Error("This Windows path form is not allowed.");
 				const deviceName = part.split(".")[0];
@@ -92,8 +94,8 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 		return relative(rootDirectory, target).split(sep).join("/");
 	}
 
-	async function regularFile(target, action) {
-		await assertPath(target);
+	async function regularFile(target, action, { allowOutside = false } = {}) {
+		if (!allowOutside || isWithinRoot(target)) await assertPath(target);
 		if (target === rootDirectory) {
 			throw new Error(`${action} requires a file path; ${workspaceName} names the workspace directory.`);
 		}
@@ -112,8 +114,8 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 			&& left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
 	}
 
-	async function readRegularBuffer(target, action) {
-		const before = await regularFile(target, action);
+	async function readRegularBuffer(target, action, { allowOutside = false } = {}) {
+		const before = await regularFile(target, action, { allowOutside });
 		if (before.size > MAX_READ_BYTES) throw new Error(`File is larger than the ${MAX_READ_BYTES} byte ${action} limit.`);
 		const handle = await open(target, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
 		try {
@@ -122,7 +124,7 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 				throw new Error("The file changed while it was being opened.");
 			}
 			const resolved = await realpath(target);
-			if (!isWithinRoot(resolved)) throw new Error("Path resolved outside the current workspace.");
+			if (!allowOutside && !isWithinRoot(resolved)) throw new Error("Path resolved outside the current workspace.");
 			const current = await lstat(target);
 			if (!current.isFile() || current.nlink > 1 || !sameFile(entry, current)) {
 				throw new Error("The file changed while it was being opened.");
@@ -307,8 +309,8 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 	}
 
 	async function readFileTool(args, { imageEnabled = false } = {}) {
-		const target = resolvePath(args.path);
-		const { buffer } = await readRegularBuffer(target, "read_file");
+		const target = resolvePath(args.path, { allowOutside: true });
+		const { buffer } = await readRegularBuffer(target, "read_file", { allowOutside: true });
 		const imageMimeType = detectImageMimeType(buffer);
 		if (imageMimeType) {
 			if (!imageEnabled) throw new Error("The configured model does not accept images.");
