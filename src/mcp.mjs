@@ -6,14 +6,16 @@ import { terminateProcessTree } from "./processes.mjs";
 const MCP_PROTOCOL_VERSION = "2025-11-25";
 const SUPPORTED_PROTOCOL_VERSIONS = new Set(["2024-11-05", "2025-03-26", "2025-06-18", MCP_PROTOCOL_VERSION]);
 const REQUEST_TIMEOUT_MS = 120_000;
-const MAX_MCP_TEXT_RESULT_CHARS = 96_000;
+const MAX_MCP_TEXT_RESULT_CHARS = 48_000;
 const MAX_MCP_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_MCP_IMAGE_COUNT = 4;
 const MAX_MCP_CONFIG_BYTES = 1024 * 1024;
 const MAX_MCP_SERVERS = 32;
-const MAX_MCP_TOOLS = 256;
-const MAX_MCP_SCHEMA_BYTES = 32 * 1024;
-const MAX_MCP_GUIDANCE_CHARS = 48 * 1024;
+const MAX_MCP_TOOLS = 32;
+const MAX_MCP_SCHEMA_BYTES = 8 * 1024;
+const MAX_MCP_TOTAL_TOOL_BYTES = 64 * 1024;
+const MAX_MCP_TOOL_DESCRIPTION_CHARS = 1_500;
+const MAX_MCP_GUIDANCE_CHARS = 8 * 1024;
 
 export async function connectMcpServers({ configPath, defaultCwd }) {
 	let config;
@@ -43,8 +45,11 @@ export async function connectMcpServers({ configPath, defaultCwd }) {
 	const toolDefinitions = [];
 	const toolLookup = new Map();
 	const serverGuidance = [];
+	let totalToolDefinitionBytes = 0;
+	let totalToolBudgetReached = false;
 
 	for (let serverIndex = 0; serverIndex < entries.length; serverIndex += 1) {
+		if (totalToolBudgetReached) break;
 		if (toolDefinitions.length >= MAX_MCP_TOOLS) {
 			warnings.push(`Ignoring additional MCP tools after the ${MAX_MCP_TOOLS}-tool limit.`);
 			break;
@@ -54,11 +59,15 @@ export async function connectMcpServers({ configPath, defaultCwd }) {
 		try {
 			client = createClient(serverName, serverConfig, defaultCwd);
 			await client.connect();
-			const remoteTools = await client.listTools();
+			const toolList = await client.listTools();
+			const remoteTools = toolList.tools;
+			if (toolList.truncated) warnings.push(`MCP server "${serverName}" returned more than ${MAX_MCP_TOOLS} tools; only the first ${MAX_MCP_TOOLS} were considered.`);
 			clients.push(client);
 			if (client.instructions) serverGuidance.push({ serverName, instructions: client.instructions });
 			for (let toolIndex = 0; toolIndex < remoteTools.length; toolIndex += 1) {
 				if (toolDefinitions.length >= MAX_MCP_TOOLS) {
+					warnings.push(`Ignoring additional MCP tools after the ${MAX_MCP_TOOLS}-tool limit.`);
+					totalToolBudgetReached = true;
 					break;
 				}
 				const remoteTool = remoteTools[toolIndex];
@@ -90,11 +99,23 @@ export async function connectMcpServers({ configPath, defaultCwd }) {
 					.filter(Boolean)
 					.join(". ")
 					.replace(/[\u0000-\u001f\u007f]/g, " ")
-					.slice(0, 4000);
-				toolDefinitions.push({
+					.slice(0, MAX_MCP_TOOL_DESCRIPTION_CHARS);
+				const definition = {
 					type: "function",
-					function: { name: functionName, description: `${description} (MCP server: ${serverName.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 128)}.)`, parameters },
-				});
+					function: {
+						name: functionName,
+						description: description + " (MCP server: " + serverName.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 128) + ".)",
+						parameters,
+					},
+				};
+				const definitionBytes = Buffer.byteLength(JSON.stringify(definition), "utf8");
+				if (totalToolDefinitionBytes + definitionBytes > MAX_MCP_TOTAL_TOOL_BYTES) {
+					warnings.push("Ignoring additional MCP tools after reaching the 64 KiB combined schema limit.");
+					totalToolBudgetReached = true;
+					break;
+				}
+				toolDefinitions.push(definition);
+				totalToolDefinitionBytes += definitionBytes;
 				toolLookup.set(functionName, { client, serverName, remoteToolName: remoteTool.name });
 			}
 		} catch (error) {
@@ -145,19 +166,22 @@ function makeFunctionName(serverIndex, toolIndex, serverName, toolName) {
 
 export function formatMcpContext(serverGuidance) {
 	if (serverGuidance.length === 0) return "";
-	const entries = [];
-	let usedChars = 0;
+	let context = "MCP server guidance:";
 	for (const { serverName, instructions } of serverGuidance) {
-		const entry = `### ${JSON.stringify(serverName)}\n${JSON.stringify(instructions)}`;
-		if (usedChars + entry.length > MAX_MCP_GUIDANCE_CHARS) break;
-		entries.push(entry);
-		usedChars += entry.length;
+		const safeName = String(serverName).replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 128);
+		const heading = "\n\n### " + JSON.stringify(safeName) + "\n";
+		const remaining = MAX_MCP_GUIDANCE_CHARS - context.length - heading.length;
+		if (remaining <= 0) break;
+		const safeInstructions = String(instructions).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, " ");
+		if (safeInstructions.length > remaining) {
+			const marker = "\n[truncated]";
+			const contentLimit = Math.max(0, remaining - marker.length);
+			context += heading + safeInstructions.slice(0, contentLimit) + (remaining > marker.length ? marker : "");
+			break;
+		}
+		context += heading + safeInstructions;
 	}
-	if (entries.length < serverGuidance.length) entries.push(`[${serverGuidance.length - entries.length} MCP instruction blocks omitted by the context size limit.]`);
-	return [
-		"MCP server guidance:",
-		...entries,
-	].join("\n");
+	return context;
 }
 
 export async function executeMcpTool(functionName, args, toolLookup, imageEnabled) {
@@ -320,9 +344,13 @@ class McpStdioClient {
 		let cursor;
 		for (let page = 0; page < 100; page += 1) {
 			const result = await this.request("tools/list", cursor ? { cursor } : {});
-			if (Array.isArray(result?.tools)) tools.push(...result.tools);
-			if (tools.length > MAX_MCP_TOOLS) throw new Error(`MCP server returned more than ${MAX_MCP_TOOLS} tools.`);
-			if (!result?.nextCursor) return tools;
+			const pageTools = Array.isArray(result?.tools) ? result.tools : [];
+			const remaining = MAX_MCP_TOOLS - tools.length;
+			tools.push(...pageTools.slice(0, remaining));
+			if (pageTools.length > remaining || (tools.length >= MAX_MCP_TOOLS && result?.nextCursor)) {
+				return { tools, truncated: true };
+			}
+			if (!result?.nextCursor) return { tools, truncated: false };
 			cursor = result.nextCursor;
 		}
 		throw new Error("MCP tools/list exceeded the 100-page limit.");
@@ -451,9 +479,13 @@ class McpHttpClient {
 		let cursor;
 		for (let page = 0; page < 100; page += 1) {
 			const result = await this.request("tools/list", cursor ? { cursor } : {});
-			if (Array.isArray(result?.tools)) tools.push(...result.tools);
-			if (tools.length > MAX_MCP_TOOLS) throw new Error(`MCP server returned more than ${MAX_MCP_TOOLS} tools.`);
-			if (!result?.nextCursor) return tools;
+			const pageTools = Array.isArray(result?.tools) ? result.tools : [];
+			const remaining = MAX_MCP_TOOLS - tools.length;
+			tools.push(...pageTools.slice(0, remaining));
+			if (pageTools.length > remaining || (tools.length >= MAX_MCP_TOOLS && result?.nextCursor)) {
+				return { tools, truncated: true };
+			}
+			if (!result?.nextCursor) return { tools, truncated: false };
 			cursor = result.nextCursor;
 		}
 		throw new Error("MCP tools/list exceeded the 100-page limit.");

@@ -8,7 +8,6 @@ import { PassThrough } from "node:stream";
 import { createWorkspaceAccess } from "../src/workspace.mjs";
 import { parseDirectoryEntryLimit } from "../src/config.mjs";
 import { collectProjectEssentials } from "../src/init-project.mjs";
-import { createFileChangeTracker } from "../src/tool-state.mjs";
 import { readStreamingResponse } from "../src/openai.mjs";
 import { chunkSummaryTranscript } from "../src/context.mjs";
 import { approvalPreview } from "../src/secrets.mjs";
@@ -17,7 +16,7 @@ import { createTerminalRendering } from "../src/markdown-terminal.mjs";
 import { prepareUserMessage } from "../src/attachments.mjs";
 import { AUTOCOMPLETE_PANEL_ROWS, buildAutocompleteState, formatAutocompletePanel, handleAutocompleteKeypress, handleControlJInput, handlePastedInput } from "../src/editor.mjs";
 import { terminalTextWidth, truncateTerminalText } from "../src/terminal-text.mjs";
-import { executeSkillTool } from "../src/skills.mjs";
+import { createSkillTools, executeSkillTool } from "../src/skills.mjs";
 
 async function temporaryWorkspace(t) {
 	const root = await mkdtemp(join(tmpdir(), "minagent-test-"));
@@ -270,35 +269,15 @@ test("text attachments keep valid UTF-8 at the excerpt boundary", async (t) => {
 
 test("skill resource reader rejects binary and invalid UTF-8", async (t) => {
 	const root = await temporaryWorkspace(t);
+	await writeFile(join(root, "valid.txt"), "reference");
 	await writeFile(join(root, "binary.txt"), Buffer.from([0x61, 0x00, 0x62]));
 	await writeFile(join(root, "invalid.txt"), Buffer.from([0xff]));
-	const skills = [{ name: "demo", directory: root }];
-	await assert.rejects(executeSkillTool("read_skill_resource", { name: "demo", path: "binary.txt" }, skills), /binary/);
-	await assert.rejects(executeSkillTool("read_skill_resource", { name: "demo", path: "invalid.txt" }, skills));
-});
-
-test("failed readback remains pending until a successful read", () => {
-	const tracker = createFileChangeTracker("win32");
-	tracker.recordToolResult("write_file", { path: "src\\File.mjs" });
-	assert.deepEqual(tracker.requiredPaths(), ["src\\File.mjs"]);
-	tracker.recordToolResult("read_file", { path: "./src/file.mjs" }, { failed: true });
-	assert.equal(tracker.hasPending(), true);
-	tracker.recordToolResult("read_file", { path: "./src/file.mjs" });
-	assert.equal(tracker.hasPending(), false);
-	tracker.requireRead("another.txt");
-	assert.deepEqual(tracker.clear(), ["another.txt"]);
-	assert.equal(tracker.hasPending(), false);
-});
-
-test("readback tracking recognizes redundant workspace prefixes", async (t) => {
-	const parent = await temporaryWorkspace(t);
-	const root = join(parent, "Test");
-	await mkdir(root);
-	const access = createWorkspaceAccess(root, "Test");
-	const tracker = createFileChangeTracker(process.platform, access.resolvePath);
-	tracker.recordToolResult("write_file", { path: "Test/note.txt" });
-	tracker.recordToolResult("read_file", { path: "note.txt" });
-	assert.equal(tracker.hasPending(), false);
+	const skills = [{ name: "demo", directory: root, instructions: "instructions" }];
+	assert.deepEqual(createSkillTools().map((tool) => tool.function.name), ["load_skill"]);
+	assert.match((await executeSkillTool("load_skill", { name: "demo" }, skills)).toolText, /instructions/);
+	assert.match((await executeSkillTool("load_skill", { name: "demo", path: "valid.txt" }, skills)).toolText, /reference/);
+	await assert.rejects(executeSkillTool("load_skill", { name: "demo", path: "binary.txt" }, skills), /binary/);
+	await assert.rejects(executeSkillTool("load_skill", { name: "demo", path: "invalid.txt" }, skills));
 });
 
 test("streaming client rejects a response stopped at the token limit", async () => {

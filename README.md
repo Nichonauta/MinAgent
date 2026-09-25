@@ -75,9 +75,9 @@ The final answer streams into a shaded assistant response as tokens arrive. Mark
 
 When `OPENAI_SHOW_REASONING=on` and the endpoint supplies a supported reasoning delta, the reasoning is printed before the final response as muted gray text without a separate panel or background. If the endpoint does not supply that field, MinAgent continues to show `Processing...` and the final response normally.
 
-The model chooses when it needs workspace contents. With `WORKSPACE_LIST_LIMIT=0`, no recursive inventory is injected and `@` file autocomplete is disabled; the model can call `list_directory` to inspect a specific directory's immediate entries. Otherwise, the inventory supplies paths but no file contents. MinAgent does not force an initial `read_file` call merely because files exist. When a request depends on project files, the model should call `read_file` before planning, diagnosing, or changing them. `list_directory` includes hidden entries, does not recurse, and returns at most 500 entries by default. After an edit or write, it must read the result back; a failed edit requires rereading the same file before retrying.
+The model chooses when it needs workspace contents. With `WORKSPACE_LIST_LIMIT=0`, no recursive inventory is injected and `@` file autocomplete is disabled; the model can call `list_directory` to inspect a specific directory's immediate entries. Otherwise, the inventory supplies paths but no file contents. MinAgent does not force an initial `read_file` call merely because files exist. When a request depends on project files, the model should call `read_file` before planning, diagnosing, or changing them. `list_directory` includes hidden entries, does not recurse, and returns at most 500 entries by default. Successful edits and writes are verified internally by MinAgent; the model does not need to read the same file back. After a failed edit, reread the file before retrying so the new edit is based on its current contents.
 
-MinAgent verifies successful writes itself and keeps required model readbacks pending across failed turns. `/new` resets that pending state and reports any paths that were left unverified. A model response may request at most 16 tool calls; a turn may use at most 32 tool rounds.
+MinAgent verifies the persisted contents before a successful edit or write tool reports completion. A model response may request at most 16 tool calls; a turn may use at most 32 tool rounds.
 
 When enabled, the inventory is refreshed before each model request. If the workspace root contains `AGENTS.md`, its content is reloaded before each request and included as project guidance up to 64 KiB, whether or not the inventory is enabled.
 
@@ -126,7 +126,7 @@ When `SKILLS_ENABLED=on`, MinAgent discovers `SKILL.md` files in these directori
 - Workspace `skills/<skill-name>/`
 - Workspace `.agents/skills/<skill-name>/`
 
-Each manifest requires YAML frontmatter with `name` and `description`. The first 24 valid skills are loaded. A manifest is limited to 96 KiB, a supporting resource to 64 KiB, and skill guidance in the model context to 32 KiB. Skills are disabled by default.
+Each manifest requires YAML frontmatter with `name` and `description`. The first 24 valid skills are loaded; catalog descriptions are shortened to 160 characters each and 8 KiB total. A skill file is limited to 64 KiB and a supporting resource to 32 KiB. The model uses one `load_skill` tool: omit `path` to load instructions, or set it to read a bundled resource. Skills are disabled by default.
 
 ## MCP servers
 
@@ -148,7 +148,7 @@ When `MCP_ENABLED=on`, MinAgent reads `.minagent/mcp.json` from the MinAgent ins
 }
 ```
 
-MinAgent discovers the server tools at startup and exposes them to the model. It supports up to 32 configured servers and 256 tools. MCP text results are limited to 96 KiB, and supported MCP images follow the same 10 MiB and four-image limits as local attachments. MCP servers run with the user's account permissions.
+MinAgent discovers server tools at startup and exposes up to 32 tools to the model. Each input schema is limited to 8 KiB, all exposed tool definitions together to 64 KiB, and combined server instructions to 8 KiB. MCP text results are limited to 48,000 characters; supported images follow the same 10 MiB and four-image limits as local attachments. MCP servers run with the user's account permissions.
 
 ## Project layout
 
@@ -156,7 +156,6 @@ MinAgent discovers the server tools at startup and exposes them to the model. It
 - `src/attachments.mjs` and `src/image.mjs`: file attachments and image handling.
 - `src/markdown-terminal.mjs` and `src/terminal-text.mjs`: streaming Markdown and terminal text layout.
 - `src/terminal-command.mjs` and `src/processes.mjs`: terminal execution and process cleanup.
-- `src/tool-state.mjs`: pending file readback and edit-recovery state.
 - `src/openai.mjs`: OpenAI-compatible SSE client, one-hour timeout, tool-call reassembly, and reasoning deltas.
 - `src/config.mjs`: `.env` loading and configuration validation.
 - `src/workspace.mjs`: workspace boundaries and file operations.
