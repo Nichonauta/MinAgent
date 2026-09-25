@@ -20,6 +20,8 @@ export const MAX_READ_LINES = 300;
 const MAX_AGENTS_BYTES = 64 * 1024;
 const MAX_INVENTORY_ENTRIES = 10_000;
 const MAX_INVENTORY_CHARS = 128 * 1024;
+const MAX_DIRECTORY_ENTRIES = 10_000;
+const MAX_DIRECTORY_OUTPUT_BYTES = 50 * 1024;
 const EXCLUDED_DIRECTORIES = new Set([".git", ".hg", ".svn", "node_modules", ".next", ".cache", "dist", "build", "coverage"]);
 
 export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = -1) {
@@ -206,6 +208,102 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 	async function readRawFile(input) {
 		const { buffer } = await readRegularBuffer(resolvePath(input), "attachment");
 		return buffer;
+	}
+
+	function escapeDirectoryLabel(value) {
+		return value.replace(/[\u0000-\u001f\u007f-\u009f]/g, (character) => `\\u${character.codePointAt(0).toString(16).padStart(4, "0")}`);
+	}
+
+	async function listDirectoryTool(args = {}) {
+		const inputPath = args.path ?? ".";
+		const limit = args.limit ?? 500;
+		if (!Number.isInteger(limit) || limit < 1 || limit > MAX_DIRECTORY_ENTRIES) {
+			throw new Error(`limit must be an integer from 1 to ${MAX_DIRECTORY_ENTRIES}.`);
+		}
+		const target = resolvePath(inputPath);
+		const displayPath = relativeName(target) || ".";
+		const safeDisplayPath = escapeDirectoryLabel(displayPath);
+		await assertPath(target);
+		let directoryEntry;
+		try {
+			directoryEntry = await lstat(target);
+		} catch (error) {
+			if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
+				throw new Error(`Directory does not exist: ${JSON.stringify(safeDisplayPath)}.`);
+			}
+			throw new Error(`Could not inspect directory ${JSON.stringify(safeDisplayPath)}: ${error?.code || "access error"}.`);
+		}
+		if (directoryEntry.isSymbolicLink()) throw new Error("Symbolic links and junctions are blocked to keep file access inside the workspace.");
+		if (!directoryEntry.isDirectory()) throw new Error(`list_directory requires a directory: ${JSON.stringify(safeDisplayPath)}.`);
+		let resolvedDirectory;
+		try {
+			resolvedDirectory = await realpath(target);
+		} catch (error) {
+			throw new Error(`Could not verify directory ${JSON.stringify(safeDisplayPath)}: ${error?.code || "access error"}.`);
+		}
+		if (!isWithinRoot(resolvedDirectory)) throw new Error("Path resolved outside the current workspace.");
+		let entries;
+		try {
+			entries = await readdir(target, { withFileTypes: true });
+		} catch (error) {
+			throw new Error(`Could not list directory ${JSON.stringify(safeDisplayPath)}: ${error?.code || "access error"}.`);
+		}
+		let currentDirectoryEntry;
+		let currentResolvedDirectory;
+		try {
+			currentDirectoryEntry = await lstat(target);
+			currentResolvedDirectory = await realpath(target);
+		} catch (error) {
+			throw new Error(`Could not verify directory ${JSON.stringify(safeDisplayPath)} after listing: ${error?.code || "access error"}.`);
+		}
+		if (!currentDirectoryEntry.isDirectory() || !sameFile(directoryEntry, currentDirectoryEntry)
+			|| !isWithinRoot(currentResolvedDirectory)) {
+			throw new Error("The directory changed while it was being listed.");
+		}
+		entries.sort((left, right) => left.name.toLowerCase().localeCompare(right.name.toLowerCase()) || left.name.localeCompare(right.name));
+		const totalEntries = entries.length;
+		if (totalEntries === 0) {
+			return {
+				toolText: `Directory: ${JSON.stringify(safeDisplayPath)}\n(empty directory)`,
+				displayText: `Listed ${JSON.stringify(safeDisplayPath)} · empty directory`,
+			};
+		}
+
+		const candidates = entries.slice(0, limit);
+		const outputLines = [`Directory: ${JSON.stringify(safeDisplayPath)}`];
+		let outputBytes = Buffer.byteLength(outputLines[0], "utf8");
+		let byteLimitReached = false;
+		for (const entry of candidates) {
+			const kind = entry.isSymbolicLink() ? "LINK, not traversed"
+				: entry.isDirectory() ? "DIR"
+					: entry.isFile() ? "FILE"
+						: "SPECIAL, not readable";
+			const suffix = entry.isDirectory() ? "/" : "";
+			const line = `[${kind}] ${escapeDirectoryLabel(entry.name)}${suffix}`;
+			const lineBytes = Buffer.byteLength(line, "utf8") + 1;
+			if (outputBytes + lineBytes > MAX_DIRECTORY_OUTPUT_BYTES - 512) {
+				byteLimitReached = true;
+				break;
+			}
+			outputLines.push(line);
+			outputBytes += lineBytes;
+		}
+		const shownEntries = outputLines.length - 1;
+		const omittedEntries = totalEntries - shownEntries;
+		if (omittedEntries > 0) {
+			if (byteLimitReached) {
+				outputLines.push(`[Output capped at ${MAX_DIRECTORY_OUTPUT_BYTES} bytes; ${omittedEntries} of ${totalEntries} entries were omitted. List a subdirectory to narrow the results.]`);
+			} else if (limit === MAX_DIRECTORY_ENTRIES) {
+				outputLines.push(`[Showing ${shownEntries} of ${totalEntries} entries; list a subdirectory to inspect the remainder beyond the ${MAX_DIRECTORY_ENTRIES}-entry limit.]`);
+			} else {
+				outputLines.push(`[Showing ${shownEntries} of ${totalEntries} entries. Call list_directory with a larger limit to see more.]`);
+			}
+		}
+		const wasTruncated = omittedEntries > 0;
+		return {
+			toolText: outputLines.join("\n"),
+			displayText: `Listed ${JSON.stringify(safeDisplayPath)} · ${shownEntries}/${totalEntries} entries${wasTruncated ? " · truncated" : ""}`,
+		};
 	}
 
 	async function readFileTool(args, { imageEnabled = false } = {}) {
@@ -439,6 +537,7 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 		workspaceName,
 		resolvePath,
 		assertPath,
+		listDirectory: listDirectoryTool,
 		readFile: readFileTool,
 		readRawFile,
 		editFile: editFileTool,

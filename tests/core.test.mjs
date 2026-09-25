@@ -121,6 +121,23 @@ test("workspace rejects directory junctions", async (t) => {
 	const access = createWorkspaceAccess(root, "test");
 	await assert.rejects(access.readFile({ path: "linked/file.txt" }), /Symbolic links/);
 	await assert.rejects(access.writeFile({ path: "linked/new.txt", content: "x" }), /Symbolic links/);
+	await assert.rejects(access.listDirectory({ path: "linked" }), /Symbolic links/);
+});
+
+test("list_directory includes hidden entries without recursing and enforces bounds", async (t) => {
+	const root = await temporaryWorkspace(t);
+	await mkdir(join(root, "child"));
+	await writeFile(join(root, ".hidden"), "hidden");
+	await writeFile(join(root, "child", "nested.txt"), "nested");
+	const access = createWorkspaceAccess(root, "test");
+	const listing = await access.listDirectory();
+	assert.match(listing.toolText, /\[FILE\] \.hidden/);
+	assert.match(listing.toolText, /\[DIR\] child\//);
+	assert.doesNotMatch(listing.toolText, /nested\.txt/);
+	const limited = await access.listDirectory({ limit: 1 });
+	assert.match(limited.toolText, /Call list_directory with a larger limit/);
+	await assert.rejects(access.listDirectory({ path: ".hidden" }), /requires a directory/);
+	await assert.rejects(access.listDirectory({ path: ".." }), /outside the current workspace/);
 });
 
 test("file tools accept a redundant workspace directory prefix", async (t) => {

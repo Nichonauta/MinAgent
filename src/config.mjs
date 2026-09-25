@@ -44,11 +44,11 @@ export function parseDirectoryEntryLimit(value) {
 }
 
 export function parseTerminalMode(value) {
-	const normalized = value.trim().toLowerCase();
+	const normalized = value.trim();
 	if (normalized === "auto") return "auto";
 	if (normalized === "ask") return "ask";
 	if (normalized === "off") return "off";
-	throw new Error("TERMINAL_MODE must be Auto, Ask, or Off.");
+	throw new Error("TERMINAL_MODE must be lowercase: auto, ask, or off.");
 }
 
 export function parseBooleanSetting(value, name, fallback) {
@@ -102,7 +102,7 @@ export async function loadConfiguration({ appDirectory, cwd = process.cwd(), env
 	if (!model) throw new Error("Set OPENAI_MODEL to the model identifier available on your endpoint.");
 	const contextWindow = parsePositiveInteger(env.OPENAI_CONTEXT_WINDOW, "OPENAI_CONTEXT_WINDOW", 262144);
 	const inputModalities = parseInputModalities(env.OPENAI_INPUT);
-	const terminalMode = parseTerminalMode(env.TERMINAL_MODE || "Ask");
+	const terminalMode = parseTerminalMode(env.TERMINAL_MODE || "ask");
 	return {
 		appDirectory,
 		applicationRoot,

@@ -24,7 +24,7 @@ OPENAI_INPUT=text,image
 OPENAI_CONTEXT_WINDOW=262144
 OPENAI_SHOW_REASONING=off
 WORKSPACE_LIST_LIMIT=-1
-TERMINAL_MODE=Off
+TERMINAL_MODE=off
 SKILLS_ENABLED=off
 MCP_ENABLED=off
 ```
@@ -39,7 +39,7 @@ Boolean settings use only `on` and `off`:
 
 For llama.cpp, use `--reasoning-format deepseek` when the model template does not automatically emit a separate `reasoning_content` channel. MinAgent displays that channel as progress text and keeps the final answer in its normal response presentation.
 
-`OPENAI_INPUT` must contain `text` and may also contain `image`. `OPENAI_CONTEXT_WINDOW` is a positive integer and defaults to `262144` tokens; set it to the actual model context limit. `WORKSPACE_LIST_LIMIT` defaults to `-1`, which lists all entries except common generated directories such as `.git`, `node_modules`, `dist`, and `build`. A non-negative value limits both the entries shown and the paths collected per directory. The inventory stops at 10,000 entries or 128 KiB of text. `TERMINAL_MODE` accepts `Auto`, `Ask`, or `Off`, and defaults to `Ask` when it is not set.
+`OPENAI_INPUT` must contain `text` and may also contain `image`. `OPENAI_CONTEXT_WINDOW` is a positive integer and defaults to `262144` tokens; set it to the actual model context limit. `WORKSPACE_LIST_LIMIT` defaults to `-1`, which lists all entries except common generated directories such as `.git`, `node_modules`, `dist`, and `build`. A non-negative value limits both the entries shown and the paths collected per directory. The inventory stops at 10,000 entries or 128 KiB of text. `TERMINAL_MODE` accepts lowercase `auto`, `ask`, or `off`, and defaults to `ask` when it is not set.
 
 ## Starting MinAgent
 
@@ -75,7 +75,7 @@ The final answer streams into a shaded assistant response as tokens arrive. Mark
 
 When `OPENAI_SHOW_REASONING=on` and the endpoint supplies a supported reasoning delta, the reasoning is printed before the final response as muted gray text without a separate panel or background. If the endpoint does not supply that field, MinAgent continues to show `Processing...` and the final response normally.
 
-The model chooses when it needs workspace contents. The workspace inventory provides paths, but MinAgent does not force an initial `read_file` call merely because files exist. When a request depends on project files, the model should call `read_file` before planning, diagnosing, or changing them. After an edit or write, it must read the result back; a failed edit requires rereading the same file before retrying.
+The model chooses when it needs workspace contents. The workspace inventory provides paths, but MinAgent does not force an initial `read_file` call merely because files exist. When a request depends on project files, the model should call `read_file` before planning, diagnosing, or changing them. It can call `list_directory` to inspect a specific directory's immediate entries; the tool includes hidden entries, does not recurse, and returns at most 500 entries by default. After an edit or write, it must read the result back; a failed edit requires rereading the same file before retrying.
 
 MinAgent verifies successful writes itself and keeps required model readbacks pending across failed turns. `/new` resets that pending state and reports any paths that were left unverified. A model response may request at most 16 tool calls; a turn may use at most 32 tool rounds.
 
@@ -107,11 +107,12 @@ Compaction also runs automatically as the configured context window fills. The s
 The model can use these built-in tools within the workspace root:
 
 - `read_file`: read a UTF-8 text file, or a supported image when image input is enabled. Text output is limited to 300 lines and 48 KiB. For a long line, use the returned `offset` and `column` to continue within that line.
+- `list_directory`: list immediate files and subdirectories, including hidden entries, without recursion. It defaults to the workspace root and 500 entries; pass a workspace-relative `path` or a larger `limit` when needed. Output is capped at 50 KiB and 10,000 entries; symbolic links are shown but never followed.
 - `edit_file`: replace one exact, unique text block in an existing file.
 - `write_file`: create or atomically replace a UTF-8 file and its missing parent directories.
 - `delete_file`: delete one regular file.
 - `delete_directory`: recursively delete a regular subdirectory after validating its contents.
-- `run_terminal`: available only when `TERMINAL_MODE` is `Auto` or `Ask`. It runs in the workspace directory; `Ask` requires approval for each command.
+- `run_terminal`: available only when `TERMINAL_MODE` is `auto` or `ask`. It runs in the workspace directory; `ask` requires approval for each command.
 
 Read, edit, write, and delete operations check for symbolic links, junctions, hard-linked files, special files, and paths outside the workspace. They also check file identity and changes around reads and replacements. Individual reads and writes are limited to 10 MiB. The workspace root cannot be deleted. A successful edit or write is reread and compared with the requested content before the tool reports success. As with other path-based Node.js file operations, an untrusted process that concurrently swaps parent directories can still race a rename or deletion; use a workspace directory tree that other untrusted processes cannot modify.
 
