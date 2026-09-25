@@ -81,13 +81,13 @@ export async function prepareUserMessage(input, selectedFileReferences, { worksp
 		const enteredPath = match[1] ?? match[2] ?? match[3];
 		try {
 			if (!inputModalities.includes("image")) throw new Error("OPENAI_INPUT does not include image.");
-			const target = workspaceAccess.resolvePath(enteredPath);
+			const target = workspaceAccess.resolvePath(enteredPath, { allowOutside: true });
 			const pathKey = process.platform === "win32" ? target.toLowerCase() : target;
 			if (seenPaths.has(pathKey)) {
 				removeImageReference(match.index, match.index + match[0].length);
 				continue;
 			}
-			const buffer = await workspaceAccess.readRawFile(enteredPath);
+			const buffer = await workspaceAccess.readRawFile(enteredPath, { allowOutside: true });
 			const mimeType = detectImageMimeType(buffer);
 			if (!mimeType) throw new Error("Unsupported format; use PNG, JPEG, GIF, or WebP.");
 			images.push({ path: enteredPath, mimeType, data: buffer.toString("base64") });

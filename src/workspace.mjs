@@ -207,8 +207,9 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 		}
 	}
 
-	async function readRawFile(input) {
-		const { buffer } = await readRegularBuffer(resolvePath(input), "attachment");
+	async function readRawFile(input, { allowOutside = false } = {}) {
+		const target = resolvePath(input, { allowOutside });
+		const { buffer } = await readRegularBuffer(target, "attachment", { allowOutside });
 		return buffer;
 	}
 

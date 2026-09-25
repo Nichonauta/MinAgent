@@ -65,7 +65,7 @@ It can also be started directly:
 node "C:\path\to\MinAgent\src\minagent.mjs"
 ```
 
-The workspace is the directory where the command is launched. `list_directory`, file changes, and image attachments are confined to it. `read_file` can also read one specifically named file outside it, but cannot list outside directories. Terminal commands and configured MCP servers run with the user's account permissions.
+The workspace is the directory where the command is launched. `list_directory`, file changes, and files selected through `@` are confined to it. `read_file` and an image path explicitly written in the prompt can read one specifically named file outside it, but cannot list outside directories. Terminal commands and configured MCP servers run with the user's account permissions.
 
 File paths are relative to that directory. To read a file outside it, pass its explicit absolute path or a relative path such as `../notes.txt` to `read_file`; outside directories cannot be listed and other file tools cannot change them. If MinAgent is started in `Test`, use `README.md` for `Test/README.md`. A redundant `Test/README.md` also resolves to the root file when there is no real `Test` subdirectory; if one exists, its paths take precedence. Use `./Test/file.txt` to explicitly target or create a same-named subdirectory. Without such a subdirectory, `Test` alone refers to the workspace root and cannot be read as a file or deleted.
 
@@ -87,7 +87,7 @@ Press `Ctrl+J` to insert a newline without sending the message. Multiline text p
 
 Type `@` followed by a filename fragment to search workspace files. Use ↑/↓ to select a result and Enter to replace the fragment with its complete path in the current line; press Enter again to submit. Selecting a text file attaches an excerpt of up to 48 KiB. Selecting an image attaches it as multimodal input. Up to eight files and four images can be attached to one message; each file is limited to 10 MiB.
 
-Image paths written directly in a message are detected for PNG, JPEG, GIF, and WebP files inside the workspace. MinAgent attaches the image data and removes the path from the text sent to the model. The model endpoint must support image input.
+Image paths written directly in a message are detected for PNG, JPEG, GIF, and WebP files inside or outside the workspace. Outside images must be named explicitly; MinAgent does not list outside directories. It attaches the image data and removes the path from the text sent to the model. The model endpoint must support image input.
 
 Set `NO_COLOR` to disable terminal colors.
 
