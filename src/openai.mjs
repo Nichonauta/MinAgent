@@ -15,6 +15,10 @@ export function createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs =
 				requestBody.tool_choice = options.toolChoice ?? "auto";
 			}
 			if (options.maxTokens) requestBody.max_tokens = options.maxTokens;
+			const signals = [];
+			if (options.signal) signals.push(options.signal);
+			if (timeoutMs > 0) signals.push(AbortSignal.timeout(timeoutMs));
+			const signal = signals.length > 1 ? AbortSignal.any(signals) : signals[0];
 			let response;
 			for (let attempt = 0; attempt < 2; attempt += 1) {
 				try {
@@ -23,13 +27,14 @@ export function createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs =
 						headers,
 						body: JSON.stringify(requestBody),
 						redirect: "error",
-						signal: timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : undefined,
+						signal,
 					});
 					break;
 				} catch (error) {
+					if (options.signal?.aborted) throw error;
 					const code = error?.cause?.code;
 					if (attempt === 0 && RETRYABLE_NETWORK_ERRORS.has(code)) {
-						await new Promise((resolve) => setTimeout(resolve, 250));
+						await waitForRetryDelay(options.signal);
 						continue;
 					}
 					const cause = code ? ` (${code})` : error?.cause?.message ? ` (${error.cause.message})` : "";
@@ -37,20 +42,36 @@ export function createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs =
 				}
 			}
 			if (!response.ok) {
-				const bodyText = await readResponsePrefix(response, 8 * 1024);
+				const bodyText = await readResponsePrefix(response, 8 * 1024, options.signal);
 				throw new Error(`Endpoint returned HTTP ${response.status}: ${bodyText}`);
 			}
 			const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
 			if (contentType.includes("text/event-stream")) {
-				return readStreamingResponse(response, options.onTextDelta, maxResponseBytes, options.onReasoningDelta);
+				return readStreamingResponse(response, options.onTextDelta, maxResponseBytes, options.onReasoningDelta, options.signal);
 			}
-			const bodyText = await readResponsePrefix(response, 2 * 1024);
+			const bodyText = await readResponsePrefix(response, 2 * 1024, options.signal);
 			throw new Error(`The endpoint did not return a streaming response (Content-Type: ${contentType || "unknown"}). Response: ${bodyText}`);
 		},
 	};
 }
 
-async function readResponsePrefix(response, maxBytes) {
+function waitForRetryDelay(signal) {
+	if (!signal) return new Promise((resolve) => setTimeout(resolve, 250));
+	if (signal.aborted) return Promise.reject(signal.reason ?? new DOMException("The operation was aborted.", "AbortError"));
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(() => {
+			signal.removeEventListener("abort", abort);
+			resolve();
+		}, 250);
+		const abort = () => {
+			clearTimeout(timer);
+			reject(signal.reason ?? new DOMException("The operation was aborted.", "AbortError"));
+		};
+		signal.addEventListener("abort", abort, { once: true });
+	});
+}
+
+async function readResponsePrefix(response, maxBytes, signal) {
 	if (!response.body) return "";
 	const reader = response.body.getReader();
 	const chunks = [];
@@ -73,10 +94,11 @@ async function readResponsePrefix(response, maxBytes) {
 		if (truncated) await reader.cancel().catch(() => {});
 		reader.releaseLock();
 	}
+	if (signal?.aborted) throw signal.reason ?? new DOMException("The operation was aborted.", "AbortError");
 	return `${Buffer.concat(chunks, totalBytes).toString("utf8")}${truncated ? " [response excerpt truncated]" : ""}`;
 }
 
-export async function readStreamingResponse(response, onTextDelta, maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES, onReasoningDelta) {
+export async function readStreamingResponse(response, onTextDelta, maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES, onReasoningDelta, signal) {
 	if (!response.body) throw new Error("Endpoint opened a streaming response without a readable body.");
 	const reader = response.body.getReader();
 	const decoder = new TextDecoder();
@@ -88,6 +110,7 @@ export async function readStreamingResponse(response, onTextDelta, maxResponseBy
 	let finished = false;
 	let bytesRead = 0;
 	let bodyDone = false;
+	let interrupted = false;
 
 	function consumeFrame(frame) {
 		const data = frame.split(/\r?\n/)
@@ -166,9 +189,18 @@ export async function readStreamingResponse(response, onTextDelta, maxResponseBy
 		buffer += decoder.decode();
 		if (buffer.trim()) consumeFrame(buffer);
 		if (!finished && !finishReason) throw new Error("Endpoint stream ended before a complete response was received.");
+	} catch (error) {
+		if (signal?.aborted) interrupted = true;
+		else throw error;
 	} finally {
 		if (!bodyDone) await reader.cancel().catch(() => {});
 		reader.releaseLock();
+	}
+	if (interrupted) {
+		return {
+			payload: { usage, finish_reason: "aborted" },
+			message: { role: "assistant", content: content || null, interrupted: true },
+		};
 	}
 
 	const message = { role: "assistant", content: content || null };

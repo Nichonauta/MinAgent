@@ -71,7 +71,7 @@ File paths are relative to that directory. To read a file outside it, pass its e
 
 ## Conversation and streaming
 
-The final answer streams into a shaded assistant response as tokens arrive. Markdown headings, lists, code fences, links, inline formatting, and tables are rendered for the terminal. Tables are aligned to the terminal width and long cell contents wrap across lines.
+The final answer streams into a shaded assistant response as tokens arrive. Press `Esc` while a model response or compaction summary is streaming to stop that request; MinAgent returns to the prompt so you can send a correction. A partial answer is kept in the conversation when available. Markdown headings, lists, code fences, links, inline formatting, and tables are rendered for the terminal. Tables are aligned to the terminal width and long cell contents wrap across lines.
 
 When `OPENAI_SHOW_REASONING=on` and the endpoint supplies a supported reasoning delta, the reasoning is printed before the final response as muted gray text without a separate panel or background. If the endpoint does not supply that field, MinAgent continues to show `Processing...` and the final response normally.
 
@@ -96,12 +96,12 @@ Set `NO_COLOR` to disable terminal colors.
 Type `/` to open command autocomplete. Use ↑/↓ to choose a command and Enter to complete it in the current line; press Enter again to run it. The available commands are:
 
 - `/context`: show approximate token counts for system sections, available tool schemas, and conversation history, plus the latest endpoint-reported `prompt_tokens` when available.
-- `/compact [instructions]`: summarize older conversation history and keep the recent messages.
+- `/compact [instructions]`: summarize history older than the recent ~20,000-token window. Compaction cuts only at safe user or completed assistant-message boundaries, so a large completed tool round can be summarized as a unit.
 - `/init [focus]`: inspect a one-time workspace inventory and selected project files, show which files were selected, and create or update the workspace root `AGENTS.md`. It reads up to 24 files, with excerpt and total-size limits.
 - `/new`: clear the screen and start a new conversation.
 - `/exit`: close MinAgent.
 
-Compaction also runs automatically as the configured context window fills. The summary preserves file paths, decisions, unresolved work, user preferences, and verification state.
+Compaction also runs automatically as the configured context window fills. The summary preserves file paths, decisions, unresolved work, user preferences, and verification state. It reduces conversation history; the system prompt, workspace guidance, inventory, and tool schemas remain. `/compact` reports both history and total context before and after, and `/context` shows the fixed prompt and tool-schema estimates.
 
 ## Workspace tools
 

@@ -77,17 +77,30 @@ export function chunkSummaryTranscript(conversationMessages, maxChars) {
 export function findCompactionCutPoint(conversationMessages, keepRecentTokens, imageTokenEstimate = 4800) {
 	const cutPoints = [];
 	for (let index = 0; index < conversationMessages.length; index += 1) {
-		if (conversationMessages[index].role === "user") cutPoints.push(index);
+		const message = conversationMessages[index];
+		// Assistant tool-call messages are valid boundaries because their tool
+		// results remain after them. The search below prefers a later completed
+		// assistant message when an oversized tool round should be summarized.
+		if (message.role === "user" || message.role === "assistant") cutPoints.push(index);
 	}
 	if (cutPoints.length === 0) return 0;
 	let accumulatedTokens = 0;
-	let cutIndex = cutPoints[0];
+	let crossedIndex = -1;
 	for (let index = conversationMessages.length - 1; index >= 0; index -= 1) {
 		accumulatedTokens += estimateMessageTokens(conversationMessages[index], imageTokenEstimate);
 		if (accumulatedTokens >= keepRecentTokens) {
-			cutIndex = cutPoints.find((candidate) => candidate >= index) ?? cutPoints.at(-1);
+			crossedIndex = index;
 			break;
 		}
 	}
-	return cutIndex;
+	if (crossedIndex < 0) return 0;
+
+	// Prefer the next completed-turn boundary after the budget is reached. This
+	// lets compaction discard a very large tool call and its results together,
+	// instead of retaining that oversized message just because it crossed the
+	// recent-history budget. If there is no later boundary, keep the nearest
+	// valid boundary at or after the crossing point.
+	return cutPoints.find((candidate) => candidate > crossedIndex)
+		?? cutPoints.find((candidate) => candidate >= crossedIndex)
+		?? cutPoints.at(-1);
 }
