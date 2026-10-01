@@ -57,7 +57,7 @@ export async function connectMcpServers({ configPath, defaultCwd }) {
 		const [serverName, serverConfig] = entries[serverIndex];
 		let client;
 		try {
-			client = createClient(serverName, serverConfig, defaultCwd);
+			client = createClient(serverConfig, defaultCwd);
 			await client.connect();
 			const toolList = await client.listTools();
 			const remoteTools = toolList.tools;
@@ -76,7 +76,7 @@ export async function connectMcpServers({ configPath, defaultCwd }) {
 					continue;
 				}
 				const functionName = makeFunctionName(serverIndex, toolIndex, serverName, remoteTool.name);
-				let parameters = remoteTool.inputSchema && typeof remoteTool.inputSchema === "object" && !Array.isArray(remoteTool.inputSchema)
+				const parameters = remoteTool.inputSchema && typeof remoteTool.inputSchema === "object" && !Array.isArray(remoteTool.inputSchema)
 					? remoteTool.inputSchema
 					: { type: "object", properties: {} };
 				try {
@@ -138,10 +138,10 @@ function emptyConnections(warnings = []) {
 	return { clients: [], toolDefinitions: [], toolLookup: new Map(), serverGuidance: [], warnings, close: async () => {} };
 }
 
-function createClient(serverName, config, defaultCwd) {
+function createClient(config, defaultCwd) {
 	if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error("Server settings must be a JSON object.");
 	if (typeof config.url === "string" && config.url.trim()) {
-		return new McpHttpClient(serverName, config);
+		return new McpHttpClient(config);
 	}
 	if (typeof config.command !== "string" || !config.command.trim()) {
 		throw new Error("Set either a stdio server command or an HTTP server URL.");
@@ -156,7 +156,7 @@ function createClient(serverName, config, defaultCwd) {
 	}
 	if (config.cwd !== undefined && typeof config.cwd !== "string") throw new Error("Server cwd must be a string.");
 	const cwd = config.cwd ? resolve(defaultCwd, config.cwd) : defaultCwd;
-	return new McpStdioClient(serverName, config.command, args, env, cwd);
+	return new McpStdioClient(config.command, args, env, cwd);
 }
 
 function makeFunctionName(serverIndex, toolIndex, serverName, toolName) {
@@ -166,10 +166,10 @@ function makeFunctionName(serverIndex, toolIndex, serverName, toolName) {
 
 export function formatMcpContext(serverGuidance) {
 	if (serverGuidance.length === 0) return "";
-	let context = "MCP server guidance:";
+	let context = "MCP guidance:";
 	for (const { serverName, instructions } of serverGuidance) {
 		const safeName = String(serverName).replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 128);
-		const heading = "\n\n### " + JSON.stringify(safeName) + "\n";
+		const heading = "\n\n" + JSON.stringify(safeName) + ":\n";
 		const remaining = MAX_MCP_GUIDANCE_CHARS - context.length - heading.length;
 		if (remaining <= 0) break;
 		const safeInstructions = String(instructions).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, " ");
@@ -226,24 +226,66 @@ export async function executeMcpTool(functionName, args, toolLookup, imageEnable
 	let toolText = textParts.join("\n\n").trim() || "The MCP tool returned no text content.";
 	if (result?.isError) toolText = `MCP tool reported an error.\n${toolText}`;
 	if (toolText.length > MAX_MCP_TEXT_RESULT_CHARS) toolText = `${toolText.slice(0, MAX_MCP_TEXT_RESULT_CHARS)}\n[Tool result truncated.]`;
-	return { toolText: `[MCP ${entry.serverName}/${entry.remoteToolName}]\n${toolText}`, images };
+	return { toolText: `[MCP ${entry.serverName}/${entry.remoteToolName}]\n${toolText}`, images, isError: Boolean(result?.isError) };
 }
 
-class McpStdioClient {
-	constructor(serverName, command, args, serverEnv, cwd) {
-		this.serverName = serverName;
+class McpClient {
+	constructor() {
+		this.nextId = 1;
+		this.instructions = "";
+	}
+
+	async connect() {
+		const result = await this.request("initialize", {
+			protocolVersion: MCP_PROTOCOL_VERSION,
+			capabilities: {},
+			clientInfo: { name: "MinAgent", version: "1.0.0" },
+		});
+		this.setProtocolVersion(result?.protocolVersion);
+		this.instructions = typeof result?.instructions === "string" ? result.instructions.slice(0, 12_000) : "";
+		await this.notify("notifications/initialized");
+	}
+
+	setProtocolVersion(version) {
+		if (!SUPPORTED_PROTOCOL_VERSIONS.has(version)) throw new Error(`Server selected unsupported MCP protocol version: ${version || "missing"}`);
+		this.protocolVersion = version;
+	}
+
+	async listTools() {
+		const tools = [];
+		let cursor;
+		for (let page = 0; page < 100; page += 1) {
+			const result = await this.request("tools/list", cursor ? { cursor } : {});
+			const pageTools = Array.isArray(result?.tools) ? result.tools : [];
+			const remaining = MAX_MCP_TOOLS - tools.length;
+			tools.push(...pageTools.slice(0, remaining));
+			if (pageTools.length > remaining || (tools.length >= MAX_MCP_TOOLS && result?.nextCursor)) {
+				return { tools, truncated: true };
+			}
+			if (!result?.nextCursor) return { tools, truncated: false };
+			cursor = result.nextCursor;
+		}
+		throw new Error("MCP tools/list exceeded the 100-page limit.");
+	}
+
+	callTool(name, argumentsValue) {
+		return this.request("tools/call", { name, arguments: argumentsValue });
+	}
+}
+
+class McpStdioClient extends McpClient {
+	constructor(command, args, serverEnv, cwd) {
+		super();
 		this.command = command;
 		this.args = args;
 		this.serverEnv = serverEnv;
 		this.cwd = cwd;
 		this.child = null;
 		this.pending = new Map();
-		this.nextId = 1;
 		this.buffer = "";
 		this.stderrTail = "";
 		this.closed = false;
 		this.failure = null;
-		this.instructions = "";
 	}
 
 	async connect() {
@@ -265,25 +307,13 @@ class McpStdioClient {
 		this.child.once("close", (code, signal) => {
 			this.fail(new Error(`Server exited (${code ?? signal ?? "unknown status"})${this.stderrTail.trim() ? `: ${this.stderrTail.trim()}` : ""}`));
 		});
-		const result = await this.request("initialize", {
-			protocolVersion: MCP_PROTOCOL_VERSION,
-			capabilities: {},
-			clientInfo: { name: "MinAgent", version: "1.0.0" },
-		});
-		this.setProtocolVersion(result?.protocolVersion);
-		this.instructions = typeof result?.instructions === "string" ? result.instructions.slice(0, 12_000) : "";
-		this.notify("notifications/initialized");
-	}
-
-	setProtocolVersion(version) {
-		if (!SUPPORTED_PROTOCOL_VERSIONS.has(version)) throw new Error(`Server selected unsupported MCP protocol version: ${version || "missing"}`);
-		this.protocolVersion = version;
+		await super.connect();
 	}
 
 	consumeStdout(chunk) {
 		this.buffer += chunk;
 		if (this.buffer.length > 16 * 1024 * 1024) {
-				this.fail(new Error("MCP server sent an oversized stdio message."));
+			this.fail(new Error("MCP server sent an oversized stdio message."));
 			this.buffer = "";
 			return;
 		}
@@ -339,27 +369,6 @@ class McpStdioClient {
 		});
 	}
 
-	async listTools() {
-		const tools = [];
-		let cursor;
-		for (let page = 0; page < 100; page += 1) {
-			const result = await this.request("tools/list", cursor ? { cursor } : {});
-			const pageTools = Array.isArray(result?.tools) ? result.tools : [];
-			const remaining = MAX_MCP_TOOLS - tools.length;
-			tools.push(...pageTools.slice(0, remaining));
-			if (pageTools.length > remaining || (tools.length >= MAX_MCP_TOOLS && result?.nextCursor)) {
-				return { tools, truncated: true };
-			}
-			if (!result?.nextCursor) return { tools, truncated: false };
-			cursor = result.nextCursor;
-		}
-		throw new Error("MCP tools/list exceeded the 100-page limit.");
-	}
-
-	callTool(name, argumentsValue) {
-		return this.request("tools/call", { name, arguments: argumentsValue });
-	}
-
 	fail(error) {
 		if (this.failure) return;
 		this.failure = error instanceof Error ? error : new Error(String(error));
@@ -388,9 +397,9 @@ class McpStdioClient {
 	}
 }
 
-class McpHttpClient {
-	constructor(serverName, config) {
-		this.serverName = serverName;
+class McpHttpClient extends McpClient {
+	constructor(config) {
+		super();
 		this.url = new URL(config.url);
 		if (!/^https?:$/.test(this.url.protocol)) throw new Error("MCP server URLs must use HTTP or HTTPS.");
 		this.serverHeaders = config.headers ?? {};
@@ -400,24 +409,6 @@ class McpHttpClient {
 		}
 		this.protocolVersion = null;
 		this.sessionId = null;
-		this.nextId = 1;
-		this.instructions = "";
-	}
-
-	async connect() {
-		const result = await this.request("initialize", {
-			protocolVersion: MCP_PROTOCOL_VERSION,
-			capabilities: {},
-			clientInfo: { name: "MinAgent", version: "1.0.0" },
-		});
-		this.setProtocolVersion(result?.protocolVersion);
-		this.instructions = typeof result?.instructions === "string" ? result.instructions.slice(0, 12_000) : "";
-		await this.notify("notifications/initialized");
-	}
-
-	setProtocolVersion(version) {
-		if (!SUPPORTED_PROTOCOL_VERSIONS.has(version)) throw new Error(`Server selected unsupported MCP protocol version: ${version || "missing"}`);
-		this.protocolVersion = version;
 	}
 
 	async request(method, params) {
@@ -472,27 +463,6 @@ class McpHttpClient {
 		if (String(result.id) !== String(id)) throw new Error(`MCP server returned the wrong response ID for ${message.method}.`);
 		if (result.error) throw new Error(result.error.message || "MCP request failed.");
 		return result.result;
-	}
-
-	async listTools() {
-		const tools = [];
-		let cursor;
-		for (let page = 0; page < 100; page += 1) {
-			const result = await this.request("tools/list", cursor ? { cursor } : {});
-			const pageTools = Array.isArray(result?.tools) ? result.tools : [];
-			const remaining = MAX_MCP_TOOLS - tools.length;
-			tools.push(...pageTools.slice(0, remaining));
-			if (pageTools.length > remaining || (tools.length >= MAX_MCP_TOOLS && result?.nextCursor)) {
-				return { tools, truncated: true };
-			}
-			if (!result?.nextCursor) return { tools, truncated: false };
-			cursor = result.nextCursor;
-		}
-		throw new Error("MCP tools/list exceeded the 100-page limit.");
-	}
-
-	callTool(name, argumentsValue) {
-		return this.request("tools/call", { name, arguments: argumentsValue });
 	}
 
 	async close() {

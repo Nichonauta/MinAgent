@@ -1,24 +1,17 @@
 import { spawn } from "node:child_process";
 import { terminateProcessTree } from "./processes.mjs";
 import { safeTerminalText } from "./terminal-text.mjs";
+import { requestToolPermission } from "./tool-permissions.mjs";
 
 export async function runTerminalCommand(args, {
-	terminalMode, terminalCommandShell, rootDirectory, interactiveTerminal, print, uiPrint, uiText,
+	terminalMode, terminalCommandShell, rootDirectory, interactiveTerminal, print, uiPrint, uiText, onStarted = () => {},
 }) {
-	if (terminalMode === "off") throw new Error("Terminal access is disabled by TERMINAL_MODE.");
 	if (typeof args.command !== "string" || !args.command.trim()) throw new Error("command must be a non-empty string.");
 	if (args.command.length > 20_000) throw new Error("command is longer than the 20,000 character limit.");
-	if (terminalMode === "ask") {
-		if (!interactiveTerminal) throw new Error("Cannot request permission outside the interactive terminal.");
-		print("");
-		uiPrint(uiText("Terminal permission requested", "warning", true));
-		uiPrint(uiText(JSON.stringify(args.command), "pale"));
-		const answer = await interactiveTerminal.question("Allow this command? [y/N] ");
-		if (!["y", "yes"].includes(answer.trim().toLowerCase())) {
-			return "Permission denied by the user. The command was not executed.";
-		}
-	}
+	const allowed = await requestToolPermission({ mode: terminalMode, setting: "TERMINAL_MODE", label: "Terminal", preview: JSON.stringify(args.command), question: "Allow this command? [y/N] " }, { interactiveTerminal, print, uiPrint, uiText });
+	if (!allowed) return "Permission denied by the user. The command was not executed.";
 
+	onStarted();
 	return new Promise((resolveResult) => {
 		const chunks = [];
 		const outputLimit = 64 * 1024;

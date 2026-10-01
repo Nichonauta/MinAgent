@@ -1,4 +1,4 @@
-import { graphemes, safeTerminalText, terminalCharacterWidth, terminalTextWidth, truncateTerminalText } from "./terminal-text.mjs";
+import { graphemes, safeTerminalText, terminalCharacterWidth, terminalTextWidth, truncateTerminalText, wrapMessage } from "./terminal-text.mjs";
 
 export function createTerminalRendering({ stdout, getUseColor, UI_COLORS, uiText, uiPrint, print }) {
 	class MarkdownTerminalRenderer {
@@ -44,7 +44,7 @@ export function createTerminalRendering({ stdout, getUseColor, UI_COLORS, uiText
 				? UI_COLORS.cyan
 				: this.quote ? UI_COLORS.muted : this.inFence ? UI_COLORS.pale : null;
 			if (color) codes.push(`38;2;${color.join(";")}`);
-			this.writeDisplay(`\u001b[0m${codes.length ? `\u001b[${codes.join(";")}m` : ""}`);
+			this.writeDisplay(`\u001b[0m\u001b[${codes.join(";")}m`);
 		}
 
 		write(input) {
@@ -353,36 +353,7 @@ export function createTerminalRendering({ stdout, getUseColor, UI_COLORS, uiText
 		}
 
 		wrapTableCell(value, width) {
-			const text = this.formatTableCell(value);
-			if (!text) return [""];
-			const lines = [];
-			let line = "";
-			let lineWidth = 0;
-			for (const word of text.split(/\s+/)) {
-				const wordWidth = terminalTextWidth(word);
-				if (line && lineWidth + 1 + wordWidth <= width) {
-					line += ` ${word}`;
-					lineWidth += 1 + wordWidth;
-					continue;
-				}
-				if (line) {
-					lines.push(line);
-					line = "";
-					lineWidth = 0;
-				}
-				for (const character of graphemes(word)) {
-					const characterWidth = terminalCharacterWidth(character);
-					if (line && lineWidth + characterWidth > width) {
-						lines.push(line);
-						line = "";
-						lineWidth = 0;
-					}
-					line += character;
-					lineWidth += characterWidth;
-				}
-			}
-			if (line) lines.push(line);
-			return lines.length ? lines : [""];
+			return wrapMessage(this.formatTableCell(value), width);
 		}
 
 		initializeTableColumns(header, separator) {
@@ -490,10 +461,7 @@ export function createTerminalRendering({ stdout, getUseColor, UI_COLORS, uiText
 				this.atLineStart = true;
 				return;
 			}
-			this.tableMode = false;
-			this.tableWidths = [];
-			this.tableAlignments = [];
-			this.flushPendingTableHeader(true);
+			this.finishTableBeforeText();
 			if (this.openingFence) {
 				this.emitText(`  Code${this.fenceInfo.trim() ? ` ${this.fenceInfo.trim()}` : ""}\n`);
 				this.openingFence = false;
@@ -553,7 +521,8 @@ export function createTerminalRendering({ stdout, getUseColor, UI_COLORS, uiText
 		let lineWidth = 0;
 		let lineStarted = false;
 		let activeStyle = "";
-		let pendingText = "";
+		let pendingWord = "";
+		let pendingWhitespace = "";
 
 		const titlePrefix = "╭─";
 		const titleText = ` ${truncateTerminalText(label, Math.max(5, contentWidth - 3))} `;
@@ -588,9 +557,26 @@ export function createTerminalRendering({ stdout, getUseColor, UI_COLORS, uiText
 			lineWidth += characterWidth;
 		}
 
-		function flushPendingText() {
-			if (pendingText) emitCluster(pendingText);
-			pendingText = "";
+		function flushPendingWord() {
+			if (!pendingWord) return;
+			const wordWidth = terminalTextWidth(pendingWord.replace(/\u001b\[[0-9;]*m/g, ""));
+			if (wordWidth > 0) {
+				if (lineWidth > 0 && lineWidth + terminalTextWidth(pendingWhitespace) + wordWidth > contentWidth) {
+					finishLine();
+					pendingWhitespace = "";
+				}
+				for (const cluster of graphemes(pendingWhitespace)) emitCluster(cluster);
+				pendingWhitespace = "";
+			}
+			for (const token of pendingWord.match(/\u001b\[[0-9;]*m|[^\u001b]+/g) ?? []) {
+				if (token.startsWith("\u001b[")) {
+					activeStyle = token === "\u001b[0m" ? "" : token;
+					if (lineStarted) stdout.write(token === "\u001b[0m" ? `${token}${backgroundStyle}` : token);
+				} else {
+					for (const cluster of graphemes(token)) emitCluster(cluster);
+				}
+			}
+			pendingWord = "";
 		}
 
 		return {
@@ -598,28 +584,23 @@ export function createTerminalRendering({ stdout, getUseColor, UI_COLORS, uiText
 				const tokens = String(value).match(/\u001b\[[0-9;]*m|[\s\S]/gu) ?? [];
 				for (const token of tokens) {
 					if (token.startsWith("\u001b[")) {
-						flushPendingText();
-						if (token === "\u001b[0m") {
-							activeStyle = "";
-							stdout.write(`${token}${backgroundStyle}`);
-						} else {
-							activeStyle = token;
-							stdout.write(token);
-						}
+						pendingWord += token;
 						continue;
 					}
 					if (token === "\n") {
-						flushPendingText();
+						flushPendingWord();
+						pendingWhitespace = "";
 						finishLine();
 						continue;
 					}
-					const clusters = graphemes(pendingText + token);
-					for (const cluster of clusters.slice(0, -1)) emitCluster(cluster);
-					pendingText = clusters.at(-1) ?? "";
+					if (/\s/u.test(token)) {
+						flushPendingWord();
+						pendingWhitespace += token;
+					} else pendingWord += token;
 				}
 			},
 			close(status = "complete") {
-				flushPendingText();
+				flushPendingWord();
 				if (lineStarted) finishLine();
 				const footerPrefix = "╰─";
 				const footerText = ` ${status} `;
@@ -651,9 +632,6 @@ export function createTerminalRendering({ stdout, getUseColor, UI_COLORS, uiText
 				bubbleWriter.close(status);
 				opened = false;
 			},
-			get opened() {
-				return opened;
-			},
 			get hasOutput() {
 				return wroteOutput;
 			},
@@ -672,7 +650,7 @@ export function createTerminalRendering({ stdout, getUseColor, UI_COLORS, uiText
 					wroteOutput = true;
 				}
 				stdout.write(uiText(text, "muted"));
-				if (text) lastCharacter = text.at(-1);
+				lastCharacter = text.at(-1);
 			},
 			close() {
 				if (wroteOutput && lastCharacter !== "\n") stdout.write("\n");

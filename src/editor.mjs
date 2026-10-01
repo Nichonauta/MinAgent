@@ -1,4 +1,5 @@
 import { insertNewline, isBulkInputChunk } from "./readline-adapter.mjs";
+import { layoutInput } from "./input-layout.mjs";
 import { safeTerminalText, truncateTerminalText } from "./terminal-text.mjs";
 
 const MAX_AUTOCOMPLETE_CANDIDATES = 1000;
@@ -7,7 +8,7 @@ const AUTOCOMPLETE_MAX_ITEMS = AUTOCOMPLETE_PANEL_ROWS - 2;
 const NAVIGATION_KEYS = new Set(["up", "down", "left", "right", "home", "end", "pageup", "pagedown", "delete", "backspace", "escape"]);
 
 export function formatAutocompletePanel(state, { columns = 80, useColor = false, uiText = (value) => value } = {}) {
-	const title = state.kind === "file" ? "Files" : "Commands";
+	const title = state.kind === "model" ? "Models" : state.kind === "file" ? "Files" : "Commands";
 	const lines = [uiText(`  ┌─ ${title.toUpperCase()} · ${state.totalMatches} match${state.totalMatches === 1 ? "" : "es"}`, state.kind === "file" ? "cyan" : "magenta", true)];
 	const firstVisibleIndex = Math.max(0, Math.min(
 		state.selectedIndex - Math.floor(AUTOCOMPLETE_MAX_ITEMS / 2),
@@ -28,7 +29,7 @@ export function formatAutocompletePanel(state, { columns = 80, useColor = false,
 			? (useColor ? `\u001b[48;2;32;93;112;38;2;226;239;241m${safeTerminalText(option)}\u001b[0m` : option)
 			: uiText(option, "muted"));
 	}
-	lines.push(uiText("  └─ ↑/↓ select · Enter complete · Esc close", "muted"));
+	lines.push(uiText(`  └─ ↑/↓ select · Enter ${state.kind === "model" ? "switch" : "complete"} · Esc close`, "muted"));
 	return lines;
 }
 
@@ -37,6 +38,58 @@ function suppressReadlineKey(key) {
 	key.name = "j";
 	key.ctrl = true;
 	key.meta = false;
+}
+
+export function handleModeKeypress(key) {
+	if (!key || key.name !== "tab" || key.ctrl || key.meta) return false;
+	suppressReadlineKey(key);
+	return true;
+}
+
+export function handleModelSelectorKeypress(state, key) {
+	if (!state || !key || (key.ctrl && key.name === "c")) return null;
+	const name = key.name;
+	const plain = !key.ctrl && !key.meta;
+	suppressReadlineKey(key);
+	if (plain && (name === "up" || name === "down")) {
+		state.selectedIndex = (state.selectedIndex + (name === "up" ? -1 : 1) + state.candidates.length) % state.candidates.length;
+		return { kind: "move" };
+	}
+	// Node readline marks a physical Esc as meta=true.
+	if (name === "escape") return { kind: "cancel" };
+	if (plain && (name === "return" || name === "enter")) return { kind: "select", model: state.candidates[state.selectedIndex].value };
+	return { kind: "ignored" };
+}
+
+export function handleVerticalInput(key, terminal, state, { prompt = "You › ", columns = 80 } = {}) {
+	if (!key || key.ctrl || key.meta || key.shift || !["up", "down"].includes(key.name)) {
+		state.goalColumn = undefined;
+		return false;
+	}
+	const layout = layoutInput(prompt, terminal.line, columns);
+	if (layout.rows.length < 2) {
+		state.goalColumn = undefined;
+		return false;
+	}
+	const current = layout.positionAt(terminal.cursor);
+	if (state.line !== terminal.line || state.cursor !== terminal.cursor || state.columns !== columns || state.prompt !== prompt) state.goalColumn = undefined;
+	state.goalColumn ??= current.column;
+	const direction = key.name === "up" ? -1 : 1;
+	let targetRow = current.row + direction;
+	let candidates = [];
+	while (targetRow >= 0 && targetRow < layout.rows.length) {
+		candidates = layout.positions.filter((position) => position.row === targetRow);
+		if (candidates.length) break;
+		targetRow += direction;
+	}
+	if (candidates.length) {
+		const target = candidates.reduce((best, candidate) => Math.abs(candidate.column - state.goalColumn) < Math.abs(best.column - state.goalColumn) ? candidate : best);
+		terminal.cursor = target.offset;
+	}
+	Object.assign(state, { line: terminal.line, cursor: terminal.cursor, columns, prompt });
+	suppressReadlineKey(key);
+	terminal.prompt(true);
+	return true;
 }
 
 function clearPendingLineFeed(state) {
@@ -48,7 +101,7 @@ function clearPendingLineFeed(state) {
 export function handlePastedInput(key, character, terminal, state) {
 	// Readline marks escape sequences as bulk chunks before its own keypress listener runs.
 	// Arrow keys are still single physical keypresses and must reach autocomplete.
-	state.bulkInputChunk = !NAVIGATION_KEYS.has(key?.name) && isBulkInputChunk(terminal);
+	state.bulkInputChunk = !NAVIGATION_KEYS.has(key?.name) && key?.sequence !== "\u001b[Z" && isBulkInputChunk(terminal);
 	if (key?.name === "paste-start") {
 		state.active = true;
 		clearPendingLineFeed(state);
@@ -89,9 +142,7 @@ export function handleControlJInput(key, character, terminal) {
 	insertNewline(terminal);
 
 	// readline otherwise treats the LF character as Enter and submits the line.
-	key.name = "j";
-	key.ctrl = true;
-	key.meta = false;
+	suppressReadlineKey(key);
 	return true;
 }
 
@@ -156,16 +207,15 @@ export function handleAutocompleteKeypress(state, key, terminal) {
 	return { kind: "complete", selectedFile: state.kind === "file" ? selected.value : null };
 }
 
-export function rankWorkspaceFiles(query, workspaceFiles) {
+function rankWorkspaceFiles(query, workspaceFiles) {
 	const normalized = query.toLowerCase();
 	const ranked = [];
 	let totalMatches = 0;
 	for (const path of workspaceFiles) {
 		const lowerPath = path.toLowerCase();
 		const fileName = lowerPath.slice(lowerPath.lastIndexOf("/") + 1);
-		let score = 0;
-		if (!normalized) score = 0;
-		else if (fileName.startsWith(normalized)) score = 0;
+		let score;
+		if (fileName.startsWith(normalized)) score = 0;
 		else if (lowerPath.startsWith(normalized)) score = 1;
 		else if (fileName.includes(normalized)) score = 2 + fileName.indexOf(normalized) / 1000;
 		else if (lowerPath.includes(normalized)) score = 3 + lowerPath.indexOf(normalized) / 1000;

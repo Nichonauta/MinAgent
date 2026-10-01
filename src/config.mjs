@@ -1,8 +1,8 @@
 import { readFileSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { realpath } from "node:fs/promises";
 
-export function loadEnvFile(filePath, target = process.env) {
+function loadEnvFile(filePath, target = process.env) {
 	let contents;
 	try {
 		contents = readFileSync(filePath, "utf8");
@@ -26,7 +26,7 @@ export function loadEnvFile(filePath, target = process.env) {
 	}
 }
 
-export function parsePositiveInteger(value, name, fallback) {
+function parsePositiveInteger(value, name, fallback) {
 	if (value === undefined || value.trim() === "") return fallback;
 	if (!/^\d+$/.test(value.trim())) throw new Error(`${name} must be a positive integer.`);
 	const parsed = Number(value.trim());
@@ -34,32 +34,13 @@ export function parsePositiveInteger(value, name, fallback) {
 	return parsed;
 }
 
-export function parseDirectoryEntryLimit(value) {
-	if (value === undefined || value.trim() === "") return 0;
-	const normalized = value.trim();
-	if (!/^-?\d+$/.test(normalized)) throw new Error("WORKSPACE_LIST_LIMIT must be 0, -1, or a positive integer.");
-	const parsed = Number(normalized);
-	if (!Number.isSafeInteger(parsed) || parsed < -1) throw new Error("WORKSPACE_LIST_LIMIT must be 0, -1, or a positive integer.");
-	return parsed;
+function parsePermissionMode(value, name, fallback) {
+	const normalized = (value || fallback).trim();
+	if (!["auto", "ask", "off"].includes(normalized)) throw new Error(`${name} must be lowercase: auto, ask, or off.`);
+	return normalized;
 }
 
-export function parseTerminalMode(value) {
-	const normalized = value.trim();
-	if (normalized === "auto") return "auto";
-	if (normalized === "ask") return "ask";
-	if (normalized === "off") return "off";
-	throw new Error("TERMINAL_MODE must be lowercase: auto, ask, or off.");
-}
-
-export function parseBooleanSetting(value, name, fallback) {
-	if (value === undefined || value.trim() === "") return fallback;
-	const normalized = value.trim().toLowerCase();
-	if (normalized === "on") return true;
-	if (normalized === "off") return false;
-	throw new Error(`${name} must be on or off.`);
-}
-
-export function parseInputModalities(value) {
+function parseInputModalities(value) {
 	const items = (value === undefined || value.trim() === "" ? "text,image" : value)
 		.split(/[\s,]+/)
 		.map((item) => item.toLowerCase())
@@ -71,12 +52,12 @@ export function parseInputModalities(value) {
 	return unique;
 }
 
-export function assertSupportedNodeVersion(version = process.versions.node) {
+function assertSupportedNodeVersion(version = process.versions.node) {
 	const major = Number(String(version).split(".")[0]);
 	if (!Number.isInteger(major) || major < 22) throw new Error(`MinAgent requires Node.js 22 or later. Installed version: ${version}.`);
 }
 
-export function makeEndpoint(baseUrl) {
+function makeEndpoint(baseUrl) {
 	let parsed;
 	try {
 		parsed = new URL(baseUrl.trim());
@@ -102,9 +83,8 @@ export async function loadConfiguration({ appDirectory, cwd = process.cwd(), env
 	if (!model) throw new Error("Set OPENAI_MODEL to the model identifier available on your endpoint.");
 	const contextWindow = parsePositiveInteger(env.OPENAI_CONTEXT_WINDOW, "OPENAI_CONTEXT_WINDOW", 262144);
 	const inputModalities = parseInputModalities(env.OPENAI_INPUT);
-	const terminalMode = parseTerminalMode(env.TERMINAL_MODE || "ask");
+	const terminalMode = parsePermissionMode(env.TERMINAL_MODE, "TERMINAL_MODE", "ask");
 	return {
-		appDirectory,
 		applicationRoot,
 		rootDirectory,
 		workspaceName: basename(rootDirectory) || "workspace",
@@ -113,13 +93,9 @@ export async function loadConfiguration({ appDirectory, cwd = process.cwd(), env
 		model,
 		contextWindow,
 		inputModalities,
-		compactionReserveTokens: Math.min(16384, Math.floor(contextWindow / 8)),
-		compactionKeepRecentTokens: Math.min(20000, Math.floor(contextWindow / 8)),
-		workspaceListLimit: parseDirectoryEntryLimit(env.WORKSPACE_LIST_LIMIT),
 		terminalMode,
 		terminalCommandShell: process.platform === "win32" ? (env.ComSpec?.trim() || "cmd.exe") : "/bin/sh",
-		skillsEnabled: parseBooleanSetting(env.SKILLS_ENABLED, "SKILLS_ENABLED", false),
-		showReasoning: parseBooleanSetting(env.OPENAI_SHOW_REASONING, "OPENAI_SHOW_REASONING", false),
-		mcpEnabled: parseBooleanSetting(env.MCP_ENABLED, "MCP_ENABLED", false),
+		skillsMode: parsePermissionMode(env.SKILLS_MODE, "SKILLS_MODE", "off"),
+		mcpMode: parsePermissionMode(env.MCP_MODE, "MCP_MODE", "off"),
 	};
 }

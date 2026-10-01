@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, createHash } from "node:crypto";
 import { constants, lstatSync } from "node:fs";
 import {
 	lstat,
@@ -12,19 +12,24 @@ import {
 } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, parse as parsePath, relative, resolve, sep } from "node:path";
 import { detectImageMimeType } from "./image.mjs";
+import { searchWorkspace } from "./search.mjs";
+import { EXCLUDED_DIRECTORIES } from "./workspace-policy.mjs";
 
-export const MAX_READ_BYTES = 10 * 1024 * 1024;
-export const MAX_WRITE_BYTES = 10 * 1024 * 1024;
+const MAX_READ_BYTES = 10 * 1024 * 1024;
+const MAX_WRITE_BYTES = 10 * 1024 * 1024;
 export const MAX_READ_OUTPUT_BYTES = 48 * 1024;
 export const MAX_READ_LINES = 300;
 const MAX_AGENTS_BYTES = 64 * 1024;
-const MAX_INVENTORY_ENTRIES = 10_000;
-const MAX_INVENTORY_CHARS = 128 * 1024;
+const MAX_AUTOCOMPLETE_ENTRIES = 10_000;
 const MAX_DIRECTORY_ENTRIES = 10_000;
 const MAX_DIRECTORY_OUTPUT_BYTES = 50 * 1024;
-const EXCLUDED_DIRECTORIES = new Set([".git", ".hg", ".svn", "node_modules", ".next", ".cache", "dist", "build", "coverage"]);
 
-export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = -1) {
+export function createWorkspaceAccess(rootDirectory, workspaceName) {
+	async function isWithinResolvedRoot(candidate) {
+		const canonicalRoot = await realpath(rootDirectory);
+		const rel = relative(canonicalRoot, candidate);
+		return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+	}
 	function isWithinRoot(candidate) {
 		const rel = relative(rootDirectory, candidate);
 		return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
@@ -114,9 +119,15 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 			&& left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
 	}
 
-	async function readRegularBuffer(target, action, { allowOutside = false } = {}) {
+	async function readRegularBuffer(target, action, { allowOutside = false, maxBytes = MAX_READ_BYTES, signal } = {}) {
+		signal?.throwIfAborted();
 		const before = await regularFile(target, action, { allowOutside });
-		if (before.size > MAX_READ_BYTES) throw new Error(`File is larger than the ${MAX_READ_BYTES} byte ${action} limit.`);
+		if (before.size > maxBytes) {
+			const error = new Error(`File is larger than the ${maxBytes} byte ${action} limit.`);
+			error.code = "READ_SIZE_LIMIT";
+			error.byteSize = before.size;
+			throw error;
+		}
 		const handle = await open(target, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
 		try {
 			const entry = await handle.stat();
@@ -124,13 +135,13 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 				throw new Error("The file changed while it was being opened.");
 			}
 			const resolved = await realpath(target);
-			if (!allowOutside && !isWithinRoot(resolved)) throw new Error("Path resolved outside the current workspace.");
+			if (!allowOutside && !await isWithinResolvedRoot(resolved)) throw new Error("Path resolved outside the current workspace.");
 			const current = await lstat(target);
 			if (!current.isFile() || current.nlink > 1 || !sameFile(entry, current)) {
 				throw new Error("The file changed while it was being opened.");
 			}
-			const buffer = await handle.readFile();
-			if (buffer.length > MAX_READ_BYTES) throw new Error(`File grew beyond the ${MAX_READ_BYTES} byte ${action} limit while being read.`);
+			const buffer = await handle.readFile({ signal });
+			if (buffer.length > maxBytes) throw new Error(`File grew beyond the ${maxBytes} byte ${action} limit while being read.`);
 			const after = await lstat(target);
 			if (!after.isFile() || !sameVersion(current, after)) throw new Error("The file changed while it was being read.");
 			return { entry: after, buffer };
@@ -153,7 +164,7 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 		return { entry, buffer, content: decodeText(buffer, action) };
 	}
 
-	async function writeAtomically(target, content, previousEntry) {
+	async function writeAtomically(target, content, previousEntry, signal) {
 		const bytes = Buffer.from(content, "utf8");
 		if (bytes.length > MAX_WRITE_BYTES) throw new Error(`File content exceeds the ${MAX_WRITE_BYTES} byte write limit.`);
 		const directory = dirname(target);
@@ -165,7 +176,7 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 			created = true;
 			try {
 				const resolvedTemp = await realpath(tempPath);
-				if (!isWithinRoot(resolvedTemp)) throw new Error("Temporary file resolved outside the current workspace.");
+				if (!await isWithinResolvedRoot(resolvedTemp)) throw new Error("Temporary file resolved outside the current workspace.");
 				await tempHandle.writeFile(bytes);
 			} finally {
 				await tempHandle.close();
@@ -183,13 +194,14 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 				if (previousEntry) throw new Error("The target file disappeared before it could be replaced.");
 			}
 			await assertPath(directory);
-			if (!isWithinRoot(await realpath(directory))) throw new Error("Target directory resolved outside the current workspace.");
+			if (!await isWithinResolvedRoot(await realpath(directory))) throw new Error("Target directory resolved outside the current workspace.");
+			signal?.throwIfAborted();
 			await rename(tempPath, target);
 			created = false;
 		} finally {
 			if (created) {
 				try {
-					if (isWithinRoot(await realpath(tempPath))) await unlink(tempPath);
+					if (await isWithinResolvedRoot(await realpath(tempPath))) await unlink(tempPath);
 				} catch {
 					// The temporary file may already have been removed or moved.
 				}
@@ -207,10 +219,24 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 		}
 	}
 
-	async function readRawFile(input, { allowOutside = false } = {}) {
+	async function readRawFile(input, { allowOutside = false, maxBytes = MAX_READ_BYTES, signal } = {}) {
 		const target = resolvePath(input, { allowOutside });
-		const { buffer } = await readRegularBuffer(target, "attachment", { allowOutside });
+		const { buffer } = await readRegularBuffer(target, "attachment", { allowOutside, maxBytes: Math.min(MAX_READ_BYTES, maxBytes), signal });
 		return buffer;
+	}
+
+	async function fileState(input) {
+		try {
+			const { entry, buffer } = await readRegularBuffer(resolvePath(input), "file state");
+			return {
+				version: [entry.dev, entry.ino, entry.size, entry.mtimeMs, entry.ctimeMs],
+				hash: createHash("sha256").update(buffer).digest("hex"),
+				content: decodeText(buffer, "file state"),
+			};
+		} catch (error) {
+			if (error?.code === "ENOENT") return null;
+			throw error;
+		}
 	}
 
 	function escapeDirectoryLabel(value) {
@@ -244,7 +270,7 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 		} catch (error) {
 			throw new Error(`Could not verify directory ${JSON.stringify(safeDisplayPath)}: ${error?.code || "access error"}.`);
 		}
-		if (!isWithinRoot(resolvedDirectory)) throw new Error("Path resolved outside the current workspace.");
+		if (!await isWithinResolvedRoot(resolvedDirectory)) throw new Error("Path resolved outside the current workspace.");
 		let entries;
 		try {
 			entries = await readdir(target, { withFileTypes: true });
@@ -260,7 +286,7 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 			throw new Error(`Could not verify directory ${JSON.stringify(safeDisplayPath)} after listing: ${error?.code || "access error"}.`);
 		}
 		if (!currentDirectoryEntry.isDirectory() || !sameFile(directoryEntry, currentDirectoryEntry)
-			|| !isWithinRoot(currentResolvedDirectory)) {
+			|| !await isWithinResolvedRoot(currentResolvedDirectory)) {
 			throw new Error("The directory changed while it was being listed.");
 		}
 		entries.sort((left, right) => left.name.toLowerCase().localeCompare(right.name.toLowerCase()) || left.name.localeCompare(right.name));
@@ -269,6 +295,7 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 			return {
 				toolText: `Directory: ${JSON.stringify(safeDisplayPath)}\n(empty directory)`,
 				displayText: `Listed ${JSON.stringify(safeDisplayPath)} · empty directory`,
+				directoryInfo: { path: displayPath, entries: [], truncated: false },
 			};
 		}
 
@@ -306,10 +333,15 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 		return {
 			toolText: outputLines.join("\n"),
 			displayText: `Listed ${JSON.stringify(safeDisplayPath)} · ${shownEntries}/${totalEntries} entries${wasTruncated ? " · truncated" : ""}`,
+			directoryInfo: {
+				path: displayPath,
+				entries: candidates.slice(0, shownEntries).map((entry) => ({ name: entry.name, kind: entry.isSymbolicLink() ? "link" : entry.isDirectory() ? "directory" : entry.isFile() ? "file" : "special" })),
+				truncated: wasTruncated,
+			},
 		};
 	}
 
-	async function readFileTool(args, { imageEnabled = false } = {}) {
+	async function readFileTool(args, { imageEnabled = false, detailed = false, maxOutputBytes = MAX_READ_OUTPUT_BYTES } = {}) {
 		const target = resolvePath(args.path, { allowOutside: true });
 		const { buffer } = await readRegularBuffer(target, "read_file", { allowOutside: true });
 		const imageMimeType = detectImageMimeType(buffer);
@@ -335,7 +367,40 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 		let output = "";
 		let outputBytes = 0;
 		let returnedLines = 0;
-		const contentBudget = MAX_READ_OUTPUT_BYTES - 160;
+		let partialLine;
+		let contentEnd;
+		if (!Number.isInteger(maxOutputBytes) || maxOutputBytes < 512) throw new Error("Read output budget must be an integer of at least 512 bytes.");
+		const contentBudget = Math.min(MAX_READ_OUTPUT_BYTES, maxOutputBytes) - 160;
+		const finishRead = (nextOffset, nextColumn) => {
+			const lastCompleteLine = returnedLines > 0 ? offset + returnedLines - 1 : undefined;
+			const info = {
+				requestedOffset: offset,
+				requestedColumn: column,
+				requestedLimit: limit,
+				totalLines: lines.length,
+				firstReturnedLine: returnedLines > 0 ? offset : partialLine?.line,
+				lastReturnedLine: partialLine?.line ?? lastCompleteLine,
+				returnedLines,
+				partialLine,
+				reachedEndOfFile: nextOffset === undefined,
+				nextOffset,
+				nextColumn,
+			};
+			if (!detailed) return output;
+			const returned = partialLine
+				? `${returnedLines > 0 ? `lines ${offset}–${lastCompleteLine}, then ` : ""}line ${partialLine.line}, columns ${partialLine.from}–${partialLine.to}`
+				: returnedLines > 0 ? `lines ${offset}–${lastCompleteLine}` : "no content";
+			const completion = info.reachedEndOfFile
+				? "end of file"
+				: `more available; next offset=${nextOffset}${nextColumn !== undefined ? `, column=${nextColumn}` : ""}`;
+			const requestedEnd = Math.min(offset + limit - 1, lines.length);
+			const displayText = `Read ${JSON.stringify(args.path)} · requested lines ${offset}–${requestedEnd}${column > 1 ? ` from column ${column}` : ""} (limit ${limit}) · returned ${returned} of ${lines.length} lines · ${completion}`;
+			return { toolText: output, displayText, readInfo: info,
+				readContent: output.slice(0, contentEnd ?? output.length),
+				readState: { hash: createHash("sha256").update(buffer).digest("hex"),
+					length: content.length, start: lines.slice(0, offset - 1).join("\n").length + (offset > 1 ? 1 : 0) + [...lines[offset - 1]].slice(0, column - 1).join("").length },
+			};
+		};
 		for (let lineIndex = offset - 1; lineIndex < Math.min(lines.length, offset - 1 + limit); lineIndex += 1) {
 			const line = lines[lineIndex];
 			const startColumn = lineIndex === offset - 1 ? column : 1;
@@ -351,7 +416,10 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 				const characterBytes = Buffer.byteLength(character, "utf8");
 				if (outputBytes + Buffer.byteLength(prefix) + fragmentBytes + characterBytes > contentBudget) {
 					output += `${prefix}${fragment}`;
-					return `${output}\n\n[Read stopped at the output limit. Continue with offset=${lineIndex + 1}, column=${currentColumn}.]`;
+					if (fragment.length > 0) partialLine = { line: lineIndex + 1, from: startColumn, to: currentColumn - 1 };
+					contentEnd = output.length;
+					output += `\n\n[Read stopped at the output limit. Continue with offset=${lineIndex + 1}, column=${currentColumn}.]`;
+					return finishRead(lineIndex + 1, currentColumn);
 				}
 				fragment += character;
 				fragmentBytes += characterBytes;
@@ -359,37 +427,45 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 			}
 			if (startColumn > currentColumn) throw new Error(`column is beyond the end of line ${lineIndex + 1}.`);
 			if (outputBytes + Buffer.byteLength(prefix) + fragmentBytes > contentBudget) {
-				return `${output}\n\n[Read stopped at the output limit. Continue with offset=${lineIndex + 1}, column=${startColumn}.]`;
+				contentEnd = output.length;
+				output += `\n\n[Read stopped at the output limit. Continue with offset=${lineIndex + 1}, column=${startColumn}.]`;
+				return finishRead(lineIndex + 1, startColumn);
 			}
 			output += `${prefix}${fragment}`;
 			outputBytes += Buffer.byteLength(prefix) + fragmentBytes;
 			returnedLines += 1;
 		}
 		const nextOffset = offset + returnedLines;
-		if (nextOffset <= lines.length) output += `\n\n[${lines.length - nextOffset + 1} more lines. Continue with offset=${nextOffset}.]`;
-		return output;
+		if (nextOffset <= lines.length) {
+			contentEnd = output.length;
+			output += `\n\n[${lines.length - nextOffset + 1} more lines. Continue with offset=${nextOffset}.]`;
+			return finishRead(nextOffset);
+		}
+		return finishRead(undefined);
 	}
 
-	async function editFileTool(args) {
+	async function editFileTool(args, options = {}) {
 		if (typeof args.old_text !== "string" || args.old_text.length === 0) throw new Error("old_text must be a non-empty string.");
 		if (typeof args.new_text !== "string") throw new Error("new_text must be a string.");
 		if (Buffer.byteLength(args.old_text, "utf8") > MAX_WRITE_BYTES || Buffer.byteLength(args.new_text, "utf8") > MAX_WRITE_BYTES) {
 			throw new Error(`old_text and new_text must each fit within the ${MAX_WRITE_BYTES} byte edit limit.`);
 		}
 		const target = resolvePath(args.path);
-		const { content, entry } = await readText(target, "edit_file");
+		const { content, entry, buffer } = await readText(target, "edit_file");
+		if (options.expectedHash && createHash("sha256").update(buffer).digest("hex") !== options.expectedHash) throw new Error("The target changed since inspection; reread it before editing.");
 		const firstIndex = content.indexOf(args.old_text);
-		if (firstIndex < 0) throw new Error(`old_text was not found in ${args.path}; no changes were made. Reread this path with read_file, then rebuild the edit from its current contents.`);
-		if (content.indexOf(args.old_text, firstIndex + args.old_text.length) >= 0) throw new Error(`old_text occurs more than once in ${args.path}; no changes were made. Reread this path with read_file and choose a unique exact text block.`);
+		if (firstIndex < 0) throw new Error(`old_text not found in ${args.path}; no changes made. Reread it, then rebuild the edit.`);
+		if (content.indexOf(args.old_text, firstIndex + args.old_text.length) >= 0) throw new Error(`old_text is not unique in ${args.path}; no changes made. Reread it and choose a unique block.`);
 		const changed = content.slice(0, firstIndex) + args.new_text + content.slice(firstIndex + args.old_text.length);
 		await writeAtomically(target, changed, entry);
 		await verifyWrittenText(target, changed);
 		return `Updated ${args.path}.`;
 	}
 
-	async function writeFileTool(args) {
+	async function writeFileTool(args, options = {}) {
 		if (typeof args.content !== "string") throw new Error("content must be a string.");
 		if (Buffer.byteLength(args.content, "utf8") > MAX_WRITE_BYTES) throw new Error(`File content exceeds the ${MAX_WRITE_BYTES} byte write limit.`);
+		options.signal?.throwIfAborted();
 		const target = resolvePath(args.path);
 		await assertPath(target);
 		await mkdir(dirname(target), { recursive: true });
@@ -404,7 +480,12 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 		} catch (error) {
 			if (error?.code !== "ENOENT") throw error;
 		}
-		await writeAtomically(target, args.content, previousEntry);
+		if (Object.hasOwn(options, "expectedState")) {
+			const currentState = await fileState(args.path);
+			if (JSON.stringify(currentState) !== JSON.stringify(options.expectedState)) throw new Error(`${args.path} changed during investigation; no generated content was written. Read current state and retry.`);
+			if (currentState && !sameVersion(previousEntry, await lstat(target))) throw new Error("The target changed before writing.");
+		}
+		await writeAtomically(target, args.content, previousEntry, options.signal);
 		await verifyWrittenText(target, args.content);
 		return `Wrote ${args.path}.`;
 	}
@@ -417,7 +498,7 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 		if (entry.isSymbolicLink()) throw new Error("Symbolic links and junctions are blocked to keep file access inside the workspace.");
 		if (!entry.isFile()) throw new Error("Only regular files can be deleted.");
 		if (entry.nlink > 1) throw new Error("Hard-linked files are blocked to keep access inside the workspace.");
-		if (!isWithinRoot(await realpath(dirname(target)))) throw new Error("Parent directory resolved outside the current workspace.");
+		if (!await isWithinResolvedRoot(await realpath(dirname(target)))) throw new Error("Parent directory resolved outside the current workspace.");
 		const current = await lstat(target);
 		if (!current.isFile() || !sameVersion(entry, current)) throw new Error("The file changed before it could be deleted.");
 		await unlink(target);
@@ -443,73 +524,46 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 		const entry = await lstat(target);
 		if (!entry.isDirectory() || entry.isSymbolicLink()) throw new Error("delete_directory only works on a regular subdirectory.");
 		await validateDeletableDirectory(target);
-		if (!isWithinRoot(await realpath(target))) throw new Error("Directory resolved outside the current workspace.");
+		if (!await isWithinResolvedRoot(await realpath(target))) throw new Error("Directory resolved outside the current workspace.");
 		const current = await lstat(target);
 		if (!current.isDirectory() || !sameFile(entry, current)) throw new Error("The directory changed before it could be deleted.");
 		await rm(target, { recursive: true, force: false, maxRetries: 2, retryDelay: 100 });
 		return `Deleted directory ${args.path} and its contents.`;
 	}
 
-	async function refreshInventory({ includeSnapshot = listLimit !== 0, listLimitOverride = listLimit } = {}) {
-		// A disabled prompt inventory still needs a bounded local file index for @ autocomplete.
-		const traversalLimit = listLimitOverride === 0 && !includeSnapshot ? -1 : listLimitOverride;
-		const lines = includeSnapshot ? [
-			"## Workspace inventory (paths only; generated directories excluded)",
-			`Per-directory limit: ${listLimitOverride === -1 ? "unlimited" : listLimitOverride}`,
-		] : [];
+	// Local paths for @ autocomplete; never added to model context.
+	async function listFiles() {
 		const filePaths = [];
-		let omittedEntries = 0;
 		let visitedEntries = 0;
-		let listedChars = lines.join("\n").length;
-		let inventoryFull = false;
-		function addLine(line) {
-			if (!includeSnapshot) return;
-			if (listedChars + line.length + 1 > MAX_INVENTORY_CHARS) {
-				inventoryFull = true;
-				return;
-			}
-			lines.push(line);
-			listedChars += line.length + 1;
-		}
-		async function appendDirectory(directoryPath, indent) {
-			if ((includeSnapshot && inventoryFull) || visitedEntries >= MAX_INVENTORY_ENTRIES) return;
+		async function appendDirectory(directoryPath) {
+			if (visitedEntries >= MAX_AUTOCOMPLETE_ENTRIES) return;
 			let entries;
 			try {
+				await assertPath(directoryPath);
 				entries = await readdir(directoryPath, { withFileTypes: true });
-			} catch (error) {
-				addLine(`${indent}[Could not list this directory: ${error?.code || "access error"}]`);
+			} catch {
 				return;
 			}
 			entries = entries.filter((entry) => !(entry.isDirectory() && EXCLUDED_DIRECTORIES.has(entry.name.toLowerCase())));
 			entries.sort((left, right) => left.name.localeCompare(right.name));
-			const visibleEntries = traversalLimit === -1 ? entries : entries.slice(0, traversalLimit);
-			omittedEntries += entries.length - visibleEntries.length;
-			for (const entry of visibleEntries) {
-				if ((includeSnapshot && inventoryFull) || visitedEntries >= MAX_INVENTORY_ENTRIES) {
-					inventoryFull = true;
-					break;
-				}
+			for (const entry of entries) {
+				if (visitedEntries >= MAX_AUTOCOMPLETE_ENTRIES) break;
 				visitedEntries += 1;
 				const childPath = join(directoryPath, entry.name);
-				if (entry.isSymbolicLink()) {
-					addLine(`${indent}[LINK, not traversed] ${entry.name}`);
-				} else if (entry.isDirectory()) {
-					addLine(`${indent}[DIR] ${entry.name}/`);
-					await appendDirectory(childPath, `${indent}  `);
+				if (entry.isSymbolicLink()) continue;
+				if (entry.isDirectory()) {
+					await appendDirectory(childPath);
 				} else if (entry.isFile()) {
 					filePaths.push(relativeName(childPath));
-					addLine(`${indent}[FILE] ${entry.name}`);
-				} else {
-					addLine(`${indent}[SPECIAL, not readable] ${entry.name}`);
 				}
 			}
 		}
-		if (traversalLimit !== 0) await appendDirectory(rootDirectory, "");
-		if (includeSnapshot && omittedEntries > 0) lines.push(`[${omittedEntries} entries omitted by WORKSPACE_LIST_LIMIT]`);
-		if (includeSnapshot && inventoryFull) lines.push(`[Inventory stopped at ${MAX_INVENTORY_ENTRIES} entries or ${MAX_INVENTORY_CHARS} characters.]`);
+		await appendDirectory(rootDirectory);
+		return filePaths.sort((left, right) => left.localeCompare(right));
+	}
+
+	async function readProjectGuidance() {
 		let guidance = "";
-		let agentsContent = "";
-		let agentsExists = false;
 		try {
 			const target = join(rootDirectory, "AGENTS.md");
 			await assertPath(target);
@@ -521,34 +575,30 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 			} else {
 				const { buffer } = await readRegularBuffer(target, "AGENTS.md");
 				if (buffer.length > MAX_AGENTS_BYTES) throw new Error("AGENTS.md grew beyond its size limit.");
-				agentsContent = decodeText(buffer, "AGENTS.md");
-				agentsExists = true;
+				const agentsContent = decodeText(buffer, "AGENTS.md");
 				guidance = `## AGENTS.md project guidance (reloaded before each model request)\n${agentsContent}`;
 			}
 		} catch (error) {
 			if (error?.code !== "ENOENT") guidance = `## AGENTS.md project guidance\nCould not load AGENTS.md: ${error?.code || error.message}`;
 		}
-		return {
-			snapshot: includeSnapshot ? lines.join("\n") : "",
-			files: filePaths.sort((left, right) => left.localeCompare(right)),
-			agentsContext: guidance,
-			agentsContent,
-			agentsExists,
-		};
+		return guidance;
 	}
 
-	return {
+	const workspace = {
 		rootDirectory,
-		workspaceName,
 		resolvePath,
-		assertPath,
 		listDirectory: listDirectoryTool,
 		readFile: readFileTool,
+		readFileDetailed: (args, options = {}) => readFileTool(args, { ...options, detailed: true }),
 		readRawFile,
+		fileState,
 		editFile: editFileTool,
 		writeFile: writeFileTool,
 		deleteFile: deleteFileTool,
 		deleteDirectory: deleteDirectoryTool,
-		refreshInventory,
+		listFiles,
+		readProjectGuidance,
 	};
+	workspace.searchFiles = (args, options) => searchWorkspace(workspace, args, options);
+	return workspace;
 }

@@ -51,48 +51,52 @@ export function truncateTerminalText(value, maxWidth) {
 	return `${output.trimEnd()}…`;
 }
 
-export function wrapTextLine(value, width) {
-	let remaining = graphemes(value);
+export function truncateStyledTerminalText(value, maxWidth) {
+	const parts = String(value).split(/(\u001b\[[0-9;]*m)/g);
+	const plain = parts.filter((_, index) => index % 2 === 0).map(safeTerminalText).join("");
+	const clipped = truncateTerminalText(plain, maxWidth);
+	const truncated = clipped !== plain;
+	let remaining = truncated ? Math.max(0, clipped.length - 1) : plain.length;
+	let result = "";
+	for (let index = 0; index < parts.length; index += 1) {
+		if (index % 2) { result += parts[index]; continue; }
+		const text = safeTerminalText(parts[index]);
+		result += text.slice(0, remaining);
+		remaining -= Math.min(remaining, text.length);
+		if (remaining === 0) break;
+	}
+	if (truncated && maxWidth > 0) result += "…";
+	return result + (String(value).includes("\u001b[") ? "\u001b[0m" : "");
+}
+
+function wrapTextLine(value, width) {
+	const clusters = graphemes(value);
+	const widths = clusters.map(terminalCharacterWidth);
+	let remainingWidth = widths.reduce((sum, size) => sum + size, 0);
+	let start = 0;
 	const lines = [];
-	while (terminalTextWidth(remaining.join("")) > width) {
+	while (remainingWidth > width) {
 		let usedWidth = 0;
-		let cut = 0;
+		let cut = start;
 		let lastSpace = -1;
-		for (let index = 0; index < remaining.length; index += 1) {
-			const characterWidth = terminalCharacterWidth(remaining[index]);
+		for (let index = start; index < clusters.length; index += 1) {
+			const characterWidth = widths[index];
 			if (usedWidth + characterWidth > width) break;
 			usedWidth += characterWidth;
 			cut = index + 1;
-			if (/\s/.test(remaining[index])) lastSpace = index;
+			if (/\s/.test(clusters[index])) lastSpace = index;
 		}
-		const breakAt = lastSpace > 0 ? lastSpace : Math.max(1, cut);
-		lines.push(remaining.slice(0, breakAt).join("").trimEnd());
-		remaining = remaining.slice(breakAt);
-		while (remaining.length && /^\s$/.test(remaining[0])) remaining.shift();
+		const breakAt = clusters[cut] && /^\s$/u.test(clusters[cut]) ? cut : lastSpace > start ? lastSpace : Math.max(start + 1, cut);
+		lines.push(clusters.slice(start, breakAt).join("").trimEnd());
+		let nextStart = breakAt;
+		while (nextStart < clusters.length && /^\s$/.test(clusters[nextStart])) nextStart += 1;
+		for (let index = start; index < nextStart; index += 1) remainingWidth -= widths[index];
+		start = nextStart;
 	}
-	lines.push(remaining.join(""));
+	if (start < clusters.length || lines.length === 0) lines.push(clusters.slice(start).join(""));
 	return lines;
 }
 
 export function wrapMessage(text, width) {
 	return safeTerminalText(text).split("\n").flatMap((line) => wrapTextLine(line, width));
-}
-
-export function terminalRowsForInput(input, promptWidth, columns) {
-	let rows = 1;
-	let column = promptWidth;
-	for (const character of graphemes(input)) {
-		if (character === "\n") {
-			rows += 1;
-			column = 0;
-			continue;
-		}
-		const width = terminalCharacterWidth(character);
-		if (column > 0 && column + width > columns) {
-			rows += 1;
-			column = 0;
-		}
-		column += width;
-	}
-	return rows;
 }

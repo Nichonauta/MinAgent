@@ -1,3 +1,5 @@
+import { modelsEndpoint, normalizeModelCatalog } from "./models.mjs";
+
 const DEFAULT_TIMEOUT_MS = 60 * 60 * 1000;
 const DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 const MAX_TOOL_ARGUMENT_CHARS = 1024 * 1024;
@@ -6,6 +8,23 @@ const RETRYABLE_NETWORK_ERRORS = new Set(["ECONNRESET", "ECONNREFUSED", "EPIPE",
 export function createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs = DEFAULT_TIMEOUT_MS, maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES }) {
 	if (!endpoint || !model || !Array.isArray(tools)) throw new Error("OpenAI client configuration is incomplete.");
 	return {
+		listModels: async ({ signal, timeoutMs: catalogTimeoutMs = 15_000 } = {}) => {
+			const headers = { Accept: "application/json" };
+			if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+			const timeoutSignal = AbortSignal.timeout(catalogTimeoutMs);
+			const response = await fetch(modelsEndpoint(endpoint), {
+				headers, redirect: "error", signal: signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal,
+			});
+			if (!response.ok) {
+				await response.body?.cancel().catch(() => {});
+				throw new Error(`Could not list models: HTTP ${response.status}${response.status === 404 || response.status === 405 ? " (this server does not expose a model catalog)" : ""}.`);
+			}
+			const body = await readResponsePrefix(response, 1024 * 1024, signal);
+			let payload;
+			try { payload = JSON.parse(body); }
+			catch { throw new Error("The API returned an invalid or oversized model catalog."); }
+			return normalizeModelCatalog(payload);
+		},
 		complete: async (requestMessages, options = {}) => {
 			const headers = { "Content-Type": "application/json" };
 			if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
@@ -47,7 +66,7 @@ export function createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs =
 			}
 			const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
 			if (contentType.includes("text/event-stream")) {
-				return readStreamingResponse(response, options.onTextDelta, maxResponseBytes, options.onReasoningDelta, options.signal);
+				return readStreamingResponse(response, options.onTextDelta, maxResponseBytes, options.onReasoningDelta, options.signal, options.onToolCallDelta);
 			}
 			const bodyText = await readResponsePrefix(response, 2 * 1024, options.signal);
 			throw new Error(`The endpoint did not return a streaming response (Content-Type: ${contentType || "unknown"}). Response: ${bodyText}`);
@@ -98,7 +117,7 @@ async function readResponsePrefix(response, maxBytes, signal) {
 	return `${Buffer.concat(chunks, totalBytes).toString("utf8")}${truncated ? " [response excerpt truncated]" : ""}`;
 }
 
-export async function readStreamingResponse(response, onTextDelta, maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES, onReasoningDelta, signal) {
+export async function readStreamingResponse(response, onTextDelta, maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES, onReasoningDelta, signal, onToolCallDelta) {
 	if (!response.body) throw new Error("Endpoint opened a streaming response without a readable body.");
 	const reader = response.body.getReader();
 	const decoder = new TextDecoder();
@@ -159,10 +178,14 @@ export async function readStreamingResponse(response, onTextDelta, maxResponseBy
 			const call = toolCalls.get(index) ?? { id: "", type: "function", function: { name: "", arguments: "" } };
 			if (deltaCall.id) call.id = deltaCall.id;
 			if (deltaCall.type) call.type = deltaCall.type;
-			if (deltaCall.function?.name) call.function.name += deltaCall.function.name;
+			if (deltaCall.function?.name) {
+				call.function.name += deltaCall.function.name;
+				onToolCallDelta?.({ index, name: call.function.name });
+			}
 			if (deltaCall.function?.arguments) {
 				call.function.arguments += deltaCall.function.arguments;
 				if (call.function.arguments.length > MAX_TOOL_ARGUMENT_CHARS) throw new Error("Endpoint returned tool arguments larger than the 1 MiB limit.");
+				onToolCallDelta?.({ index, name: call.function.name });
 			}
 			toolCalls.set(index, call);
 		}
@@ -210,12 +233,12 @@ export async function readStreamingResponse(response, onTextDelta, maxResponseBy
 	if (finishReason === "length") throw new Error("Endpoint stopped at its output token limit; the partial response was discarded.");
 	if (finishReason === "content_filter") throw new Error("Endpoint stopped the response because of its content filter.");
 	for (const call of message.tool_calls ?? []) {
-		if (!call.id || !call.function.name) throw new Error("Endpoint returned an incomplete tool call.");
+		if (!call.id || !call.function.name) throw Object.assign(new Error("Endpoint returned an incomplete tool call."), { code: "INVALID_TOOL_CALL" });
 		try {
 			const args = JSON.parse(call.function.arguments);
 			if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error();
 		} catch {
-			throw new Error(`Endpoint returned invalid arguments for tool ${call.function.name}.`);
+			throw Object.assign(new Error(`Endpoint returned invalid arguments for tool ${call.function.name}.`), { code: "INVALID_TOOL_CALL" });
 		}
 	}
 	return { payload: { usage, finish_reason: finishReason }, message };

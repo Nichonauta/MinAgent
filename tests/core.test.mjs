@@ -6,8 +6,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { createWorkspaceAccess } from "../src/workspace.mjs";
-import { parseDirectoryEntryLimit } from "../src/config.mjs";
-import { collectProjectEssentials } from "../src/init-project.mjs";
 import { readStreamingResponse } from "../src/openai.mjs";
 import { chunkSummaryTranscript } from "../src/context.mjs";
 import { approvalPreview } from "../src/secrets.mjs";
@@ -58,39 +56,40 @@ test("read_file can continue within a long Unicode line", async (t) => {
 	assert.equal(collected, content);
 });
 
-test("inventory excludes generated directories and obeys the listing limit", async (t) => {
+test("file autocomplete excludes generated directories and finds all source paths", async (t) => {
 	const root = await temporaryWorkspace(t);
-	for (const directory of [".git", "node_modules", "src"]) await mkdir(join(root, directory));
-	await writeFile(join(root, ".git", "secret"), "x");
-	await writeFile(join(root, "node_modules", "package.js"), "x");
+	for (const directory of [".git", ".hg", ".svn", "node_modules", ".next", ".cache", "dist", "BUILD", "coverage"]) {
+		await mkdir(join(root, directory));
+		await writeFile(join(root, directory, "generated.txt"), "needle");
+	}
+	await mkdir(join(root, "src"));
 	await writeFile(join(root, "src", "main.mjs"), "x");
-	const complete = await createWorkspaceAccess(root, "test").refreshInventory();
-	assert.deepEqual(complete.files, ["src/main.mjs"]);
-	const empty = await createWorkspaceAccess(root, "test", 0).refreshInventory();
-	assert.deepEqual(empty.files, ["src/main.mjs"]);
+	await writeFile(join(root, "src", "second.mjs"), "needle");
+	const files = await createWorkspaceAccess(root, "test").listFiles();
+	assert.deepEqual(files, ["src/main.mjs", "src/second.mjs"]);
+	const search = await createWorkspaceAccess(root, "test").searchFiles({ query: "needle", mode: "content" });
+	assert.deepEqual(search.searchInfo.results.map((hit) => hit.path), ["src/second.mjs"]);
+	assert.equal(search.searchInfo.stats.excludedDirectories, 9);
 });
 
-test("disabled inventory still loads AGENTS.md and permits a one-time full listing", async (t) => {
+test("project guidance reloads AGENTS.md independently of local file autocomplete", async (t) => {
 	const root = await temporaryWorkspace(t);
 	await writeFile(join(root, "AGENTS.md"), "Project guidance");
 	await writeFile(join(root, "README.md"), "Project");
-	assert.equal(parseDirectoryEntryLimit(undefined), 0);
-	const access = createWorkspaceAccess(root, "test", 0);
-	const normal = await access.refreshInventory();
-	assert.equal(normal.snapshot, "");
-	assert.deepEqual(normal.files, ["AGENTS.md", "README.md"]);
-	assert.match(normal.agentsContext, /Project guidance/);
-	const forInit = await access.refreshInventory({ includeSnapshot: true, listLimitOverride: -1 });
-	assert.match(forInit.snapshot, /\[FILE\] README\.md/);
-	assert.ok(forInit.files.includes("README.md"));
+	const access = createWorkspaceAccess(root, "test");
+	assert.deepEqual(await access.listFiles(), ["AGENTS.md", "README.md"]);
+	const guidance = await access.readProjectGuidance();
+	assert.match(guidance, /Project guidance/);
+	assert.doesNotMatch(guidance, /README\.md/);
+	await writeFile(join(root, "AGENTS.md"), "Updated rules");
+	assert.match(await access.readProjectGuidance(), /Updated rules/);
 });
 
 test("oversized AGENTS.md is omitted from model guidance", async (t) => {
 	const root = await temporaryWorkspace(t);
 	await writeFile(join(root, "AGENTS.md"), "a".repeat(70_000));
-	const inventory = await createWorkspaceAccess(root, "test").refreshInventory();
-	assert.match(inventory.agentsContext, /exceeds the .* byte limit/);
-	assert.equal(inventory.agentsContent, "");
+	const guidance = await createWorkspaceAccess(root, "test").readProjectGuidance();
+	assert.match(guidance, /exceeds the .* byte limit/);
 });
 
 test("workspace rejects hard links", async (t) => {
@@ -234,29 +233,6 @@ test("deletion stays within a validated subdirectory", async (t) => {
 	assert.equal(await readFile(join(root, "keep.txt"), "utf8"), "keep");
 });
 
-test("project initialization includes source files with unfamiliar names", async (t) => {
-	const root = await temporaryWorkspace(t);
-	await mkdir(join(root, "src"));
-	await writeFile(join(root, "README.md"), "Project");
-	await writeFile(join(root, "src", "minagent.mjs"), "export const x = 1;");
-	const access = createWorkspaceAccess(root, "test");
-	const result = await collectProjectEssentials({ rootDirectory: root, readWorkspaceRaw: access.readRawFile });
-	assert.deepEqual(result.files.map((file) => file.path), ["README.md", "src/minagent.mjs"]);
-});
-
-test("project initialization prioritizes its entry point within a small context budget", async (t) => {
-	const parent = await temporaryWorkspace(t);
-	const root = join(parent, "MinAgent");
-	await mkdir(join(root, "src"), { recursive: true });
-	await writeFile(join(root, "README.md"), "r".repeat(1000));
-	await writeFile(join(root, "src", "alpha.mjs"), "a".repeat(1000));
-	await writeFile(join(root, "src", "minagent.mjs"), "m".repeat(1000));
-	const access = createWorkspaceAccess(root, "test");
-	const result = await collectProjectEssentials({ rootDirectory: root, readWorkspaceRaw: access.readRawFile, maxTotalChars: 1024 });
-	assert.ok(result.files.some((file) => file.path === "src/minagent.mjs"));
-	assert.ok(result.files.reduce((sum, file) => sum + file.content.length, 0) <= 1024);
-});
-
 test("text attachments keep valid UTF-8 at the excerpt boundary", async (t) => {
 	const root = await temporaryWorkspace(t);
 	await writeFile(join(root, "note.txt"), `${"a".repeat(48 * 1024 - 1)}😀end`);
@@ -278,6 +254,7 @@ test("skill resource reader rejects binary and invalid UTF-8", async (t) => {
 	assert.match((await executeSkillTool("load_skill", { name: "demo", path: "valid.txt" }, skills)).toolText, /reference/);
 	await assert.rejects(executeSkillTool("load_skill", { name: "demo", path: "binary.txt" }, skills), /binary/);
 	await assert.rejects(executeSkillTool("load_skill", { name: "demo", path: "invalid.txt" }, skills));
+	await assert.rejects(executeSkillTool("read_skill_resource", { name: "demo", path: "valid.txt" }, skills), /not available/);
 });
 
 test("streaming client rejects a response stopped at the token limit", async () => {

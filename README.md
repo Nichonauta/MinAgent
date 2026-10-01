@@ -22,24 +22,44 @@ OPENAI_API_KEY=llama.cpp
 OPENAI_MODEL=llama.cpp
 OPENAI_INPUT=text,image
 OPENAI_CONTEXT_WINDOW=262144
-OPENAI_SHOW_REASONING=off
-WORKSPACE_LIST_LIMIT=0
 TERMINAL_MODE=off
-SKILLS_ENABLED=off
-MCP_ENABLED=off
+SKILLS_MODE=off
+MCP_MODE=off
 ```
 
 `OPENAI_MODEL` is required. `OPENAI_BASE_URL` defaults to `https://api.openai.com/v1` and is normalized to the `/chat/completions` endpoint. `OPENAI_API_KEY` is optional. Each request can remain active for up to one hour before timing out.
 
-Boolean settings use only `on` and `off`:
+`TERMINAL_MODE`, `SKILLS_MODE`, and `MCP_MODE` accept lowercase `auto`, `ask`, or `off`:
 
-- `OPENAI_SHOW_REASONING=on` displays the reasoning channel as muted gray text while it streams. `off` keeps the regular `Processing...` indicator. The endpoint must send `choices[0].delta.reasoning_content` (llama.cpp) or `choices[0].delta.reasoning_summary`.
-- `SKILLS_ENABLED=on` loads local skills. The default is `off`.
-- `MCP_ENABLED=on` loads configured MCP servers. The default is `off`.
+| Mode | Behavior |
+| --- | --- |
+| `auto` | Execute without asking for approval. |
+| `ask` | Request approval for each terminal command, skill instructions/resource load, or MCP tool call. |
+| `off` | Disable the feature and omit its tools from the model's catalog. |
+
+Terminal permissions default to `ask`; skills and MCP default to `off`. Skills and MCP are discovered at startup in `auto` and `ask`. Approval applies to using their tools.
 
 For llama.cpp, use `--reasoning-format deepseek` when the model template does not automatically emit a separate `reasoning_content` channel. MinAgent displays that channel as progress text and keeps the final answer in its normal response presentation.
 
-`OPENAI_INPUT` must contain `text` and may also contain `image`. `OPENAI_CONTEXT_WINDOW` is a positive integer and defaults to `262144` tokens; set it to the actual model context limit. `WORKSPACE_LIST_LIMIT` defaults to `0`, which disables recursive inventory in the model context. `@` file autocomplete still searches a local index bounded to 10,000 entries and excludes common generated directories. The model can also call `list_directory` for a focused listing. A positive value includes up to that many entries per directory; `-1` includes all entries. Inventories stop at 10,000 entries or 128 KiB of text. `/init` builds a one-time inventory regardless of this setting. `TERMINAL_MODE` accepts lowercase `auto`, `ask`, or `off`, and defaults to `ask` when it is not set.
+`OPENAI_INPUT` must contain `text` and may also contain `image`. `OPENAI_CONTEXT_WINDOW` is a positive integer and defaults to `262144` tokens; set it to the actual model context limit. `@` file autocomplete builds a local index when used, bounded to 10,000 entries and excluding common generated directories. This index is not sent to the model. The model can call `list_directory` for a focused listing, and `/init` investigates through directory listings and file reads.
+
+## Context and tool execution
+
+MinAgent uses the full `OPENAI_CONTEXT_WINDOW`, 300-line default reads capped at 48 KiB with continuation, 100 default search results, and up to 16 tool calls per response. Multiple changes can be requested in one response. Long non-file outputs retain their beginning and end within a 64,000-character budget, with omissions marked. The modes are Build and Plan.
+
+Set `OPENAI_CONTEXT_WINDOW` to the server's actual context limit. Automatic compaction reserves up to 16,384 tokens for output, bounded to one quarter of that window, and retains about 20,000 recent-history tokens, also bounded to one quarter. Showing reasoning changes its display, not the server's thinking configuration.
+
+Before editing an existing file, the agent requires evidence of the current exact block from `read_file`. Complete replacement requires a complete read, including consecutive partial reads. New files can be created directly. Successful writes update evidence; external changes or executed terminal/MCP calls invalidate it. Terminal commands still follow `TERMINAL_MODE` and can modify files independently of file-tool evidence checks.
+
+Tool messages include status, read ranges, total lines, continuation, command exit status and uncertain changes. Invalid streamed calls get at most two correction attempts without executing incomplete requests. Batches exceeding 16 calls are rejected in full. Repeated failures and unchanged results are detected; persisted file contents are verified, but this does not mean application behavior was tested.
+
+When enabled, MCP exposes the discovered tool schemas and server guidance in Build. Calls follow `MCP_MODE`. Evidence is bounded to 64 files and two million characters; evicted evidence must be read again. Under context pressure, older inspection bodies are removed while result metadata and tool-call pairing remain; compacted results retain both the beginning and end. Current task evidence survives conversation compacting and is cleared by `/new`.
+
+### Reproducible model evaluation
+
+`node scripts/evaluate.mjs --live` runs five isolated temporary fixtures against the configured API: targeted editing, read continuation, Plan boundaries, recovery after an external edit, and `/init`. It sends actual API requests; JSON output reports the model, task success, invalid/repeated calls, evidence failures, mode violations, elapsed time and tokens. Provider token usage is distinguished from estimates. A forbidden Plan attempt is reported even if the controller blocks it and the file remains unchanged.
+
+Keep the model and quantization fixed when comparing runs. These fixtures measure specific outcomes, not every possible false claim or overall model quality. No live evaluation is performed by the ordinary unit tests.
 
 ## Starting MinAgent
 
@@ -73,17 +93,35 @@ File paths are relative to that directory. To read a file outside it, pass its e
 
 The final answer streams into a shaded assistant response as tokens arrive. Press `Esc` while a model response or compaction summary is streaming to stop that request; MinAgent returns to the prompt so you can send a correction. A partial answer is kept in the conversation when available. Markdown headings, lists, code fences, links, inline formatting, and tables are rendered for the terminal. Tables are aligned to the terminal width and long cell contents wrap across lines.
 
-When `OPENAI_SHOW_REASONING=on` and the endpoint supplies a supported reasoning delta, the reasoning is printed before the final response as muted gray text without a separate panel or background. If the endpoint does not supply that field, MinAgent continues to show `Processing...` and the final response normally.
+Chat bubbles wrap at word boundaries. Streaming holds the current word until a space, newline, or response end reveals its full width; words that do not fit move to the next line. Only words wider than the entire bubble are split. Stopping a response flushes its pending word.
 
-The model chooses when it needs workspace contents. With `WORKSPACE_LIST_LIMIT=0`, no recursive inventory is injected, while `@` file autocomplete remains available from a bounded local index. The model can call `list_directory` to inspect a specific directory's immediate entries. Otherwise, the inventory supplies paths but no file contents. MinAgent does not force an initial `read_file` call merely because files exist. When a request depends on project files, the model should call `read_file` before planning, diagnosing, or changing them. `list_directory` includes hidden entries, does not recurse, and returns at most 500 entries by default. Successful edits and writes are verified internally by MinAgent; the model does not need to read the same file back. After a failed edit, reread the file before retrying so the new edit is based on its current contents.
+When the endpoint supplies a supported reasoning delta, MinAgent always displays it in muted gray text as it streams, before the final answer. If the endpoint does not supply a reasoning delta, MinAgent shows `Processing...` until the final answer arrives.
+
+The model chooses when it needs workspace contents and can call `list_directory` to inspect a specific directory's immediate entries. MinAgent does not send an automatic directory listing or force an initial `read_file` call merely because files exist. When a request depends on project files, the model should call `read_file` before planning, diagnosing, or changing them. `list_directory` includes hidden entries, does not recurse, and returns at most 500 entries by default. Successful edits and writes are verified internally by MinAgent; the model does not need to read the same file back. After a failed edit, reread the file before retrying so the new edit is based on its current contents.
 
 MinAgent verifies the persisted contents before a successful edit or write tool reports completion. A model response may request at most 16 tool calls; a turn may use at most 32 tool rounds.
 
-When enabled, the inventory is refreshed before each model request. If the workspace root contains `AGENTS.md`, its content is reloaded before each request and included as project guidance up to 64 KiB, whether or not the inventory is enabled.
+If the workspace root contains `AGENTS.md`, its content is reloaded before each request and included as project guidance up to 64 KiB.
+
+## Build and Plan modes
+
+MinAgent starts in **Build**, with the configured workspace tools, terminal permissions, skills, and MCP tools. Press **Tab** (or Shift+Tab) to alternate between Build and **Plan** without changing your draft. The input label shows `Build ›` in green or `Plan ›` in amber; `Tab mode` appears in the shortcuts.
+
+Plan can only call `list_directory`, `read_file`, and `search_files`. It inspects relevant files and answers questions or proposes changes in the chat. Editing, writing, deletion, terminal commands, skills, and MCP calls are blocked before execution, including tools requested outside the advertised catalog. `/init` is also blocked because it writes `AGENTS.md`. Session commands such as `/model`, `/compact`, `/new`, and `/exit` remain available.
+
+Each submitted message keeps its selected mode, including queued messages. Tab during a response selects the mode for the next message; the current response continues with its original permissions. When these modes differ, the bar also shows `Running: Build` or `Running: Plan`. Model selectors and approval prompts retain keyboard priority. Tabs within pasted text remain text.
+
+Both modes share the conversation. Changing to Build does not start implementation automatically; send your implementation request. Plan-specific instructions and tool schemas are replaced when the active mode changes, rather than appended to conversation history.
+
+Plan describes steps, affected files, interfaces, and expected behavior. Its instructions exclude complete implementations, replacement files, and full patches; brief pseudocode or minimal snippets are reserved for explaining a decision.
+
+Application instructions live in `src/prompts.mjs`: shared rules, Build/Plan, compaction, `/init`, and extension guidance. Compaction sends its instructions once in the system message and keeps transcript, previous checkpoint, and user focus in the data message. Project guidance and external skill/MCP content retain their existing contents and size limits.
 
 ## Input, multiline text, and file attachments
 
 Press `Ctrl+J` to insert a newline without sending the message. Multiline text pasted into the prompt keeps its line breaks and does not submit one request per line. Press Enter to send.
+
+Use `↑` and `↓` to move between visible rows of a multiline message, including rows wrapped by the terminal width. The cursor preserves its preferred column across shorter lines. With autocomplete open, these keys select suggestions; with a single-row message, they navigate history.
 
 Type `@` followed by a filename fragment to search workspace files. Use ↑/↓ to select a result and Enter to replace the fragment with its complete path in the current line; press Enter again to submit. Selecting a text file attaches an excerpt of up to 48 KiB. Selecting an image attaches it as multimodal input. Up to eight files and four images can be attached to one message; each file is limited to 10 MiB.
 
@@ -95,13 +133,15 @@ Set `NO_COLOR` to disable terminal colors.
 
 Type `/` to open command autocomplete. Use ↑/↓ to choose a command and Enter to complete it in the current line; press Enter again to run it. The available commands are:
 
-- `/context`: show approximate token counts for system sections, available tool schemas, and conversation history, plus the latest endpoint-reported `prompt_tokens` when available.
-- `/compact [instructions]`: summarize history older than the recent ~20,000-token window. Compaction cuts only at safe user or completed assistant-message boundaries, so a large completed tool round can be summarized as a unit.
-- `/init [focus]`: inspect a one-time workspace inventory and selected project files, show which files were selected, and create or update the workspace root `AGENTS.md`. It reads up to 24 files, with excerpt and total-size limits.
 - `/new`: clear the screen and start a new conversation.
+- `/init [focus]`: list the root, read existing `AGENTS.md`, and let the model investigate important files using only listing, searching, and reading tools. Each attempt and result is shown, including read ranges, continuations, and errors. After evidence checks, generate and save the root `AGENTS.md`. Root documentation/manifests/configuration must be inspected when present; relevant project subdirectories and discovered source code require exploration. Investigation is limited to 16 rounds, 16 calls per response, and 60% of the configured context estimate. Insufficient evidence, cancellation, invalid output, or concurrent changes to `AGENTS.md` prevent saving. Empty repositories receive a minimal guide. Esc cancels investigation or generation; `/init` remains unavailable in Plan.
+- `/model`: query the current API's `/models` catalog and open a selector. Use ↑/↓ to choose, Enter to switch, or Esc to close. `/model identifier` switches directly to an identifier in that catalog. Changes apply for this session and preserve the conversation; commands entered during a response wait their turn in the queue. Esc also cancels a pending catalog request.
+- `/compact [instructions]`: summarize history older than the recent ~20,000-token window. Compaction cuts only at safe user or completed assistant-message boundaries, so a large completed tool round can be summarized as a unit.
 - `/exit`: close MinAgent.
 
-Compaction also runs automatically as the configured context window fills. The summary preserves file paths, decisions, unresolved work, user preferences, and verification state. It reduces conversation history; the system prompt, workspace guidance, inventory, and tool schemas remain. `/compact` reports both history and total context before and after, and `/context` shows the fixed prompt and tool-schema estimates.
+Model catalogs do not guarantee support for chat, tools, or images. When provided, positive `context_window`/`context_length` and `input_modalities` (or `architecture.input_modalities`) update the session settings. Otherwise, the original configured context size and input capabilities apply, and MinAgent reports that fallback. A declared text-only model cannot receive a conversation containing images; start with `/new` before switching. `OPENAI_MODEL` still determines the next session's initial model.
+
+Compaction also runs automatically as the configured context window fills. The summary preserves file paths, decisions, unresolved work, user preferences, and verification state. It reduces conversation history; the system prompt, workspace guidance, and tool schemas remain. `/compact` reports both history and total context before and after. Current context usage remains visible in the persistent status bar.
 
 ## Workspace tools
 
@@ -109,6 +149,7 @@ The model can use these built-in tools; directory listings and file changes stay
 
 - `read_file`: read a specifically named UTF-8 text file inside or outside the workspace, or a supported image when image input is enabled. It cannot list directories. Text output is limited to 300 lines and 48 KiB. For a long line, use the returned `offset` and `column` to continue within that line.
 - `list_directory`: list immediate files and subdirectories, including hidden entries, without recursion. It defaults to the workspace root and 500 entries; pass a workspace-relative `path` or a larger `limit` when needed. Output is capped at 50 KiB and 10,000 entries; symbolic links are shown but never followed.
+- `search_files`: recursively search a literal, non-empty single-line `query` in filenames, UTF-8 content, or both (`mode`: `filename`, `content`, `both`; default: `both`). `path` selects a workspace directory; `case_sensitive` defaults to false. Content results include a 1-based line/Unicode character column and a redacted snippet; one matching line counts as one result. Results distinguish filename hits from content hits. Searches exclude common generated directories, skip links and binary/invalid text, and report omissions/errors. Limits: 100 results by default (maximum 500), 48 KiB output, 10,000 entries, 10 MiB per file, 64 MiB total reads, and 15 seconds. Esc stops an active search and preserves partial results with a canceled status. Narrow the path/query when results are incomplete; use `read_file` for full context. `/init` may search to locate sources, but results do not satisfy its required file reads.
 - `edit_file`: replace one exact, unique text block in an existing file.
 - `write_file`: create or atomically replace a UTF-8 file and its missing parent directories.
 - `delete_file`: delete one regular file.
@@ -119,18 +160,18 @@ Reads check file identity and changes around opening and reading. `read_file` ca
 
 ## Skills
 
-When `SKILLS_ENABLED=on`, MinAgent discovers `SKILL.md` files in these directories:
+When `SKILLS_MODE` is `auto` or `ask`, MinAgent discovers `SKILL.md` files in these directories:
 
 - MinAgent `skills/<skill-name>/`
 - MinAgent `.agents/skills/<skill-name>/`
 - Workspace `skills/<skill-name>/`
 - Workspace `.agents/skills/<skill-name>/`
 
-Each manifest requires YAML frontmatter with `name` and `description`. The first 24 valid skills are loaded; catalog descriptions are shortened to 160 characters each and 8 KiB total. A skill file is limited to 64 KiB and a supporting resource to 32 KiB. The model uses one `load_skill` tool: omit `path` to load instructions, or set it to read a bundled resource. Skills are disabled by default.
+Each manifest requires YAML frontmatter with `name` and `description`. The first 24 valid skills are discovered; catalog descriptions are shortened to 160 characters each and 8 KiB total. A skill file is limited to 64 KiB and a supporting resource to 32 KiB. The model uses one `load_skill` tool: omit `path` to load instructions, or set it to read a bundled resource. In `ask`, each load requires approval; in `auto`, it runs directly. `off` skips discovery and disables the tool. Skills are disabled by default.
 
 ## MCP servers
 
-When `MCP_ENABLED=on`, MinAgent reads `.minagent/mcp.json` from the MinAgent installation directory. The file must contain an `mcpServers` object. Servers can use local stdio transport or Streamable HTTP:
+When `MCP_MODE` is `auto` or `ask`, MinAgent reads `.minagent/mcp.json` from the MinAgent installation directory. The file must contain an `mcpServers` object. Servers can use local stdio transport or Streamable HTTP:
 
 ```json
 {
@@ -148,23 +189,32 @@ When `MCP_ENABLED=on`, MinAgent reads `.minagent/mcp.json` from the MinAgent ins
 }
 ```
 
-MinAgent discovers server tools at startup and exposes up to 32 tools to the model. Each input schema is limited to 8 KiB, all exposed tool definitions together to 64 KiB, and combined server instructions to 8 KiB. MCP text results are limited to 48,000 characters; supported images follow the same 10 MiB and four-image limits as local attachments. MCP servers run with the user's account permissions.
+MinAgent discovers server tools at startup and exposes up to 32 tools to the model. In `ask`, each call requires approval; in `auto`, it runs directly. `off` skips server connections and tool discovery. MCP is disabled by default. Each input schema is limited to 8 KiB, all exposed tool definitions together to 64 KiB, and combined server instructions to 8 KiB. MCP text results are limited to 48,000 characters; supported images follow the same 10 MiB and four-image limits as local attachments. MCP servers run with the user's account permissions.
 
 ## Project layout
 
 - `src/minagent.mjs`: TUI, conversation loop, tool dispatch, and commands.
+- `src/agent-mode.mjs`: Build/Plan permissions and mode state.
+- `src/agent-runtime.mjs`: tool validation, edit evidence, result metadata, and loop guards.
 - `src/attachments.mjs` and `src/image.mjs`: file attachments and image handling.
 - `src/markdown-terminal.mjs` and `src/terminal-text.mjs`: streaming Markdown and terminal text layout.
 - `src/terminal-command.mjs` and `src/processes.mjs`: terminal execution and process cleanup.
+- `src/tool-permissions.mjs`: shared Auto/Ask/Off permissions for terminal commands, skills, and MCP.
 - `src/openai.mjs`: OpenAI-compatible SSE client, one-hour timeout, tool-call reassembly, and reasoning deltas.
 - `src/config.mjs`: `.env` loading and configuration validation.
 - `src/workspace.mjs`: workspace boundaries and file operations.
+- `src/workspace-policy.mjs`: shared generated-directory exclusions for file autocomplete, searches, and `/init`.
 - `src/editor.mjs`: multiline editing, paste handling, and autocomplete.
+- `src/commands.mjs`: shared slash-command catalog.
+- `src/input-layout.mjs` and `src/terminal-footer.mjs`: visual input rows, cursor navigation, and the persistent status bar.
 - `src/readline-adapter.mjs`: isolated access to Node's interactive readline state.
 - `src/context.mjs`: token estimation, conversation serialization, and compaction.
 - `src/skills.mjs`: local skill discovery and skill tools.
 - `src/mcp.mjs`: MCP configuration, transports, tool discovery, and result handling.
 - `src/init-project.mjs`: project file selection for `/init`.
+- `src/search.mjs` and `src/tool-definitions.mjs`: literal workspace search and built-in tool schemas.
+- `src/secrets.mjs`: secret redaction for previews and tool output.
+- `src/evaluation.mjs` and `scripts/evaluate.mjs`: isolated model evaluation fixtures and the optional live runner.
 - `minagent.cmd` and `minagent.ps1`: Windows launchers.
 
 ## Tests

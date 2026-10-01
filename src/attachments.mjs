@@ -1,5 +1,5 @@
 import { detectImageMimeType, imageContentPart } from "./image.mjs";
-import { MAX_READ_BYTES, MAX_READ_OUTPUT_BYTES } from "./workspace.mjs";
+import { MAX_READ_OUTPUT_BYTES } from "./workspace.mjs";
 
 const MAX_ATTACHED_IMAGES = 4;
 const MAX_ATTACHED_FILES = 8;
@@ -40,7 +40,6 @@ export async function prepareUserMessage(input, selectedFileReferences, { worksp
 			const pathKey = process.platform === "win32" ? target.toLowerCase() : target;
 			if (seenPaths.has(pathKey)) continue;
 			const buffer = await workspaceAccess.readRawFile(relativePath);
-			if (buffer.length > MAX_READ_BYTES) throw new Error(`Exceeds the ${MAX_READ_BYTES} byte limit.`);
 			const mimeType = detectImageMimeType(buffer);
 			if (mimeType) {
 				if (!inputModalities.includes("image")) throw new Error("The configured model does not accept images.");
@@ -103,7 +102,7 @@ export async function prepareUserMessage(input, selectedFileReferences, { worksp
 	for (const replacement of replacements.sort((left, right) => right.start - left.start)) {
 		text = text.slice(0, replacement.start) + text.slice(replacement.end);
 	}
-	const prompt = [text.trim(), ...textAttachments].filter(Boolean).join("\n\n") || "Analyze the attached image.";
+	const prompt = [text.trim(), ...textAttachments].filter(Boolean).join("\n\n") || "Analyze this image.";
 	const message = images.length === 0 && textAttachments.length === 0
 		? { role: "user", content: input }
 		: { role: "user", content: [{ type: "text", text: prompt }, ...images.map(imageContentPart)] };
